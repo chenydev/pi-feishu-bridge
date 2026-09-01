@@ -188,6 +188,11 @@ export class ConversationManager {
 						streamedText += e.delta;
 					}
 				} else if (e.type === "message_end") {
+					// 诊断：打印事件原始结构（定位提取 textLen 过短问题）
+					this.deps.log?.("debug", "feishu.conv.message_end_raw", {
+						chatId: sess.chatId,
+						raw: JSON.stringify(e).slice(0, 600),
+					});
 					const text = extractText(e.message?.content ?? e.content);
 					this.deps.log?.("debug", "feishu.conv.message_end_extract", {
 						chatId: sess.chatId,
