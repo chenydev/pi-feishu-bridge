@@ -239,3 +239,13 @@ reply API 返回 code=230003(消息不存在) → sender 降级 create 新消息
 - [ ] 流式输出：首版同步 chunk 发送（pi-feishu-link 现状）；后续评估卡片流式（hermes 无，pi-feishu-link 有 reasoning card）。
 - [ ] 审批卡片：复用 pi-feishu-link 的 permission-bridge 设计或首版直通（autoApprove）。
 - [ ] reaction 处理中 emoji：默认开启但可关（飞书 API 限流需守护）。
+
+## 11. 实现踩坑记录（2026-09-02 部署实测）
+
+| 坑 | 现象 | 修复 |
+|---|---|---|
+| lark SDK 1.73.1 `EventDispatcher` 不接受 undefined 参数 | `Cannot destructure property 'encryptKey' of 'params'` | `new EventDispatcher({})` |
+| SDK 1.73.1 WSClient **没有 `stop()`**，关闭方法是 `close({force})` | stop() 静默失败 → WS 连接泄漏 → 飞书「连接数超限」code=1000040350 | 接口改 `close({force:true})`；start() 前先关旧实例 |
+| watchdog 握手期误判 | 每次启动多一次多余重连（水合 → reconnect → ready） | `connectStartedAt` + 15s 宽限期 |
+| bot 身份水合字段 | `/open-apis/bot/v3/info` 返回 `app_name`（非 bot_name） | name 兼容 app_name |
+| 会话文件相对路径 | `sessions/feishu/…` 相对 cwd=/workspace → EACCES | ConversationManager 注入绝对 sessionDir |
