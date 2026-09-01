@@ -92,7 +92,7 @@ export class FeishuTransport {
 		if (!this.botIdentity.name && config.botName) this.botIdentity.name = config.botName;
 		this.deps.log?.("info", "feishu.transport.bot_identity", this.botIdentity);
 
-		const dispatcher = new sdk.EventDispatcher().register({
+		const dispatcher = new sdk.EventDispatcher({}).register({
 			"im.message.receive_v1": async (data: unknown) => this.handleRawMessage(data),
 			"im.message.message_read_v1": async () => undefined,
 			"im.message.recalled_v1": async () => undefined,
@@ -196,7 +196,14 @@ export class FeishuTransport {
 				const data = (res?.bot ?? res?.data ?? res) as Record<string, unknown>;
 				const identity: BotIdentity = {
 					openId: typeof data.open_id === "string" ? data.open_id : undefined,
-					name: typeof data.bot_name === "string" ? data.bot_name : typeof data.name === "string" ? data.name : undefined,
+					name:
+						typeof data.bot_name === "string"
+							? data.bot_name
+							: typeof data.app_name === "string"
+								? data.app_name
+								: typeof data.name === "string"
+									? data.name
+									: undefined,
 					userId: typeof data.user_id === "string" ? data.user_id : undefined,
 				};
 				if (identity.openId || identity.name) {
