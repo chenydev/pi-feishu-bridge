@@ -114,12 +114,46 @@ export class ConversationManager {
 					conversationKey: sess.conversationKey,
 					sessionFile: sess.sessionFile,
 				});
-				// 流式事件（首版仅记日志；完整流式见 DESIGN §10 待决）
-				sess.agent.subscribe((ev) => {
-					const e = ev as { type?: string };
-					this.deps.log?.("debug", "feishu.conv.agent_event", { chatId: sess.chatId, type: e?.type ?? "?" });
-				});
 			}
+
+			// 流式/完成事件：从 subscribe 事件提取回复文本（pi SDK 的 prompt() 返回值
+			// 结构不可靠，pi-feishu-link 同样走事件通道：message_update.text_delta 累积、
+			// message_end.content 完整提取）。
+			let streamedText = "";
+			let sentFromEvent = false;
+			const sendReply = async (text: string): Promise<void> => {
+				if (sentFromEvent || !text.trim()) return;
+				sentFromEvent = true;
+				try {
+					await this.deps.sender.send(sess.chatId, text.trim(), {
+						replyTo: sess.lastReplyId ?? item.replyToMessageId,
+					});
+				} catch (err) {
+					this.deps.log?.("error", "feishu.conv.send_error", {
+						chatId: sess.chatId,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			};
+			sess.agent.subscribe((ev) => {
+				const e = ev as {
+					type?: string;
+					delta?: string;
+					assistantMessageEvent?: { type?: string; delta?: string };
+					message?: { content?: unknown; id?: string };
+					content?: unknown;
+				};
+				if (e.type === "message_update") {
+					if (e.assistantMessageEvent?.type === "text_delta" && typeof e.assistantMessageEvent.delta === "string") {
+						streamedText += e.assistantMessageEvent.delta;
+					} else if (typeof e.delta === "string") {
+						streamedText += e.delta;
+					}
+				} else if (e.type === "message_end") {
+					const text = extractText(e.message?.content ?? e.content);
+					if (text) void sendReply(text);
+				}
+			});
 
 			// 组装提示词（回复链路可见性：B1）
 			let prompt = item.text;
@@ -130,18 +164,13 @@ export class ConversationManager {
 			const timeout = new Promise<never>((_, reject) =>
 				setTimeout(() => reject(new Error("run timeout")), this.runTimeoutMs),
 			);
-			const done = this.deps.sessionBackend && sess.agent ? sess.agent.prompt(prompt) : Promise.resolve();
-			const result = await Promise.race([done, timeout]);
+			const result = await Promise.race([sess.agent.prompt(prompt), timeout]);
 
-			const text = extractAssistantText(result);
-			if (text) {
-				await this.deps.sender.send(sess.chatId, text, {
-					replyTo: sess.lastReplyId ?? item.replyToMessageId,
-				});
+			// 兜底：事件通道未送出则用累积流式文本/返回值
+			if (!sentFromEvent) {
+				const text = streamedText.trim() || extractAssistantText(result);
+				if (text) await sendReply(text);
 			}
-			// 记录本 bot 最近发送的消息 id（replyToBot 判定 + 下次回复挂链）
-			// 由 sender.onSent 回调维护；此处同步最近一次 reply id：
-			// 由桥层统一维护 LastSentCache，本处只更新 sess.lastReplyId
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			if (msg === "run timeout") {
@@ -170,6 +199,20 @@ export class ConversationManager {
 	stop(): void {
 		this.sessions.clear();
 	}
+}
+
+/** 从事件 content 提取文本（pi 的 assistant message content 结构：string 或 [{type:'text',text}] 数组）。 */
+export function extractText(content: unknown): string {
+	if (typeof content === "string") return content.trim();
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((p) =>
+			p && typeof p === "object" && (p as { type?: string }).type === "text"
+				? ((p as { text?: string }).text ?? "")
+				: "",
+		)
+		.join("")
+		.trim();
 }
 
 /** 从 agent 结果中提取助手文本（兼容字符串/含 message 的对象）。 */
