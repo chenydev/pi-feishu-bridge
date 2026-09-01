@@ -188,11 +188,10 @@ export class ConversationManager {
 						streamedText += e.delta;
 					}
 				} else if (e.type === "message_end") {
-					// 诊断：打印事件原始结构（定位提取 textLen 过短问题）
-					this.deps.log?.("debug", "feishu.conv.message_end_raw", {
-						chatId: sess.chatId,
-						raw: JSON.stringify(e).slice(0, 600),
-					});
+					// 关键：user 消息也会触发 message_end（role=user），必须先到会抢占
+					// sentFromEvent 导致 assistant 完整回复被跳过（对齐 pi-feishu-link
+					// handleMessageEnd 的 role==='assistant' 检查）
+					if (e.message?.role !== "assistant") return;
 					const text = extractText(e.message?.content ?? e.content);
 					this.deps.log?.("debug", "feishu.conv.message_end_extract", {
 						chatId: sess.chatId,
