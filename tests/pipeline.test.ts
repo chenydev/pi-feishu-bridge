@@ -177,3 +177,35 @@ test("stripInjectedPrompt：剥离复述的 hermes 式回复注入", async () =>
 	assert.ok(!out.includes("正在回复的消息原文"));
 	assert.equal(out, "好的！");
 });
+
+test("会话隔离：话题消息独立会话 key（hermes thread_id 参与 key）", async () => {
+	// 通过 ConversationManager 验证：话题消息与普通消息不同会话文件
+	const { ConversationManager } = await import("../src/session/conversation-manager.js");
+	const sessionFiles: string[] = [];
+	const sentTo: Array<{ chat: string; thread?: string }> = [];
+	const mgr = new ConversationManager({
+		config: cfg({ groupPolicy: "open" }),
+		sessionDir: "/tmp/feishu-test-sessions",
+		sessionBackend: {
+			async createSession(opts) {
+				sessionFiles.push(opts.sessionFile ?? "");
+				return {
+					sessionId: "s",
+					async prompt() { return undefined; },
+					subscribe() { return () => {}; },
+					modelId: "m",
+				};
+			},
+		},
+		sender: {
+			async send(chat: string, _text: string, opts?: { threadId?: string }) { sentTo.push({ chat, thread: opts?.threadId }); return { success: true }; },
+		} as never,
+	} as never);
+	const base = { messageId: "m1", chatId: "oc_g", chatType: "group" as const, senderId: "u", isBot: false, msgType: "text" as const, text: "hi", mentions: [], ts: Date.now(), raw: undefined };
+	await mgr.route({ ...base, messageId: "m1" } as never);
+	await mgr.route({ ...base, messageId: "m2", threadId: "om_t1", chatType: "topic" } as never);
+	// 两个不同 key → 两个 sessionFile；话题文件含 t 标记
+	assert.equal(sessionFiles.length, 2);
+	assert.ok(sessionFiles[0] !== sessionFiles[1]);
+	assert.match(sessionFiles[1], /oc_g_t_om_t1/);
+});

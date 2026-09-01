@@ -28,7 +28,10 @@ export interface ConversationManagerDeps {
 
 interface BridgeSession {
 	conversationKey: string;
+	/** 原始 chatId（发送目标）；key 用于会话隔离。 */
 	chatId: string;
+	/** 话题 id（话题会话的发送目标 threadId）。 */
+	threadId?: string;
 	agent?: Awaited<ReturnType<SessionBackend["createSession"]>>;
 	sessionFile: string;
 	queue: Array<QueuedMessage>;
@@ -76,13 +79,18 @@ export class ConversationManager {
 	 * 回复链路：入站 replyToText 注入提示词；出站 send 挂 chat 上一条 bot 消息。
 	 */
 	async route(msg: FeishuInboundMessage): Promise<void> {
-		const key = msg.chatId;
+		// 会话 key（对齐 hermes build_session_key）：
+		// - 私聊：chatId（= p2p chat）
+		// - 群普通消息：chatId
+		// - 话题消息：chatId + threadId → 话题独立会话（hermes：thread_id 参与 key）
+		const key = msg.threadId ? `${msg.chatId}:t:${msg.threadId}` : msg.chatId;
 		let sess = this.sessions.get(key);
 		if (!sess) {
 			sess = {
 				conversationKey: key,
-				chatId: key,
-				sessionFile: join(this.deps.sessionDir, `${key}.jsonl`),
+				chatId: msg.chatId,
+				threadId: msg.threadId,
+				sessionFile: join(this.deps.sessionDir, `${key.replace(/[^a-zA-Z0-9_-]/g, "_")}.jsonl`),
 				queue: [],
 				activeRun: false,
 				createdAt: this.now(),
@@ -154,10 +162,11 @@ export class ConversationManager {
 						this.deps.log?.("debug", "feishu.conv.empty_after_strip", { chatId: sess.chatId });
 						return;
 					}
-					// 回复挂用户消息（hermes: reply_to = source.message_id）
+					// 回复挂用户消息（hermes: reply_to = source.message_id）；
+					// 话题会话发送到话题（threadId 优先会话级，其次消息级）
 					const res = await this.deps.sender.send(sess.chatId, cleaned, {
 						replyTo: item.messageId,
-						threadId: item.threadId,
+						threadId: sess.threadId ?? item.threadId,
 					});
 					this.deps.log?.("info", "feishu.conv.reply_sent", {
 						chatId: sess.chatId,
@@ -221,10 +230,13 @@ export class ConversationManager {
 			}
 			this.lastQuoteBlock = prompt;
 
-			const timeout = new Promise<never>((_, reject) =>
-				setTimeout(() => reject(new Error("run timeout")), this.runTimeoutMs),
-			);
+			// 运行超时保护（300s；timer 必须清理，否则测试/进程悬挂）
+			let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+			const timeout = new Promise<never>((_, reject) => {
+				timeoutTimer = setTimeout(() => reject(new Error("run timeout")), this.runTimeoutMs);
+			});
 			const result = await Promise.race([sess.agent.prompt(prompt), timeout]);
+			if (timeoutTimer) clearTimeout(timeoutTimer);
 
 			// 兜底：事件通道未送出则用累积流式文本/返回值
 			if (!sentFromEvent) {
