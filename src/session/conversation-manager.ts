@@ -51,6 +51,8 @@ export class ConversationManager {
 	private sessions = new Map<string, BridgeSession>();
 	private runTimeoutMs: number;
 	private now: () => number;
+	/** 最近一次注入的引用块（发送前清洗模型复述用）。 */
+	private lastQuoteBlock = "";
 
 	constructor(private deps: ConversationManagerDeps) {
 		this.runTimeoutMs = deps.runTimeoutMs ?? 300_000;
@@ -139,7 +141,9 @@ export class ConversationManager {
 				if (sentFromEvent || !text.trim()) return;
 				sentFromEvent = true;
 				try {
-					const res = await this.deps.sender.send(sess.chatId, text.trim(), {
+					// 模型偶发复述注入的引用块/提示：剥离后发送
+					const cleaned = stripInjectedPrompt(text, this.lastQuoteBlock);
+					const res = await this.deps.sender.send(sess.chatId, cleaned, {
 						replyTo: sess.lastReplyId ?? item.replyToMessageId,
 					});
 					this.deps.log?.("info", "feishu.conv.reply_sent", {
@@ -188,12 +192,16 @@ export class ConversationManager {
 			});
 
 			// 组装提示词（回复链路可见性：B1）
-			// 引用块格式 + 明确"不要复述提示"——实测模型会复述旧格式提示词。
+			// 自然引用块格式（实测：显式"系统提示"字样会被 deepseek 复述进回复）
 			let prompt = item.text;
 			if (item.replyToMessageId && item.replyToText) {
-				const quote = item.replyToText.slice(0, 500).replace(/\n/g, "\n> ");
-				prompt = `> ${quote}\n\n[系统提示：用户回复了上面的消息。请直接回复用户的新消息，不要复述本条提示。]\n\n${item.text}`;
+				const quote = item.replyToText
+					.slice(0, 500)
+					.replace(/@_user_\w+/g, "@")
+					.replace(/\n/g, "\n> ");
+				prompt = `> ${quote}\n\n${item.text}`;
 			}
+			this.lastQuoteBlock = prompt;
 
 			const timeout = new Promise<never>((_, reject) =>
 				setTimeout(() => reject(new Error("run timeout")), this.runTimeoutMs),
@@ -248,6 +256,22 @@ export class ConversationManager {
 	stop(): void {
 		this.sessions.clear();
 	}
+}
+
+/**
+ * 剥离模型复述的注入提示（引用块 + 空行 + 原始用户消息残留）：
+ * - 删除开头的 `> 引用` 连续块
+ * - 删除"以下是用户回复…"等引导句残留
+ */
+export function stripInjectedPrompt(text: string, quoteBlock: string): string {
+	let out = text;
+	// 精确剥离本次注入块（若被完整复述）
+	if (quoteBlock && out.includes(quoteBlock)) out = out.replace(quoteBlock, "");
+	// 兜底：剥离开头引用块行（> ...）
+	out = out.replace(/^(> [^\n]*\n?)+/, "");
+	// 兜底：剥离引用引导句
+	out = out.replace(/^(以下是用户回复[^\n]*\n?)+/, "");
+	return out.trim();
 }
 
 /** 从事件 content 提取文本（pi 的 assistant message content 结构：string 或 [{type:'text',text}] 数组）。 */
