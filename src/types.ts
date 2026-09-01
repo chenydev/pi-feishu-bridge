@@ -62,7 +62,7 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 	batch: { enabled: true, textWindowMs: 3000 },
 	forwarding: { acceptMergeForward: true },
 	approval: { autoApprove: [], timeoutMs: 300_000 },
-	reaction: { processingEmoji: "THINKING", enabled: true },
+	reaction: { processingEmoji: "Typing", enabled: true },
 	sessionDir: "sessions/feishu",
 	debug: false,
 	lastSentCacheSize: 64,
