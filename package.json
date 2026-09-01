@@ -1,0 +1,40 @@
+{
+  "name": "pi-feishu-bridge",
+  "version": "0.1.0",
+  "description": "Feishu/Lark bridge for Pi agent — hermes-grade messaging: per-chat group policy, robust @mention (ID+name+@_all), real reply chain with quoted-text fetch, dedup/batching, WS long-connection daemon.",
+  "type": "module",
+  "main": "src/index.ts",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/normalize.test.ts tests/admit.test.ts tests/pipeline.test.ts tests/sender.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.60.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.23.13",
+    "typescript": "^5.6.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "feishu",
+    "lark",
+    "bridge",
+    "bot"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
