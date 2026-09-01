@@ -106,6 +106,8 @@ export class FeishuTransport {
 			"im.chat.member.bot.added_v1": async () => undefined,
 			"im.chat.member.bot.removed_v1": async () => undefined,
 			"im.message.reaction.created_v1": async () => undefined,
+			// 撤回自身表情也会收到 deleted 事件：注册空 handler 消除 SDK warn
+			"im.message.reaction.deleted_v1": async () => undefined,
 		});
 
 		this.wsClient = new sdk.WSClient({
