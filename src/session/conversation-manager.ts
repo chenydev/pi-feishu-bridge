@@ -143,6 +143,7 @@ export class ConversationManager {
 				if (sentFromEvent || !text.trim()) return;
 				sentFromEvent = true;
 				try {
+					this.deps.log?.("debug", "feishu.conv.send_reply_start", { chatId: sess.chatId, textLen: text.length });
 					// 模型偶发复述注入的引用块/提示：剥离后发送
 					const cleaned = stripInjectedPrompt(text, this.lastQuoteBlock);
 					if (!cleaned.trim()) {

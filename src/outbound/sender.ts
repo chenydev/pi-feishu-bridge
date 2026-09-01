@@ -190,15 +190,22 @@ export class Sender {
 	}
 
 	private async rawSend(chatId: string, msgType: "text" | "post", payload: string, opts: SendOptions, uuidValue: string): Promise<unknown> {
-		if (opts.replyTo) {
-			return this.deps.transport.rawRequest({
-				url: `/open-apis/im/v1/messages/${opts.replyTo}/reply`,
-				method: "POST",
-				data: { content: payload, msg_type: msgType, uuid: uuidValue, reply_in_thread: Boolean(opts.threadId) },
-			});
-		}
-		const body: Record<string, unknown> = { receive_id: opts.threadId ?? chatId, msg_type: msgType, content: payload, uuid: uuidValue };
-		const params = opts.threadId ? { receive_id_type: "thread_id" } : { receive_id_type: "chat_id" };
-		return this.deps.transport.rawRequest({ url: "/open-apis/im/v1/messages", method: "POST", params, data: body });
+		const req = opts.replyTo
+			? this.deps.transport.rawRequest({
+					url: `/open-apis/im/v1/messages/${opts.replyTo}/reply`,
+					method: "POST",
+					data: { content: payload, msg_type: msgType, uuid: uuidValue, reply_in_thread: Boolean(opts.threadId) },
+				})
+			: this.deps.transport.rawRequest({
+					url: "/open-apis/im/v1/messages",
+					method: "POST",
+					params: opts.threadId ? { receive_id_type: "thread_id" } : { receive_id_type: "chat_id" },
+					data: { receive_id: opts.threadId ?? chatId, msg_type: msgType, content: payload, uuid: uuidValue },
+				});
+		// 30s 超时保护：SDK request 偶发 hang（实测：无超时时回复静默丢失）
+		return Promise.race([
+			req,
+			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("request timeout after 30s")), 30_000)),
+		]);
 	}
 }
