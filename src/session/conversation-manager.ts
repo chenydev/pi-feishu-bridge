@@ -12,6 +12,11 @@ export interface ConversationManagerDeps {
 	sessionDir: string;
 	sessionBackend: SessionBackend;
 	sender: Sender;
+	/** 处理中表情（reaction）能力：入队时添加、回复发出后撤回。 */
+	reactions?: {
+		add(messageId: string, emoji: string): Promise<string | undefined>;
+		remove(messageId: string, reactionId: string): Promise<boolean>;
+	};
 	/** agent 回复文本的发送器（默认 sender.send 到 chat，回复挂 bot 上一条消息）。 */
 	log?: (level: "debug" | "info" | "warn" | "error", msg: string, meta?: unknown) => void;
 	/** 超时（默认 300s）后通知用户并释放。 */
@@ -35,6 +40,9 @@ interface QueuedMessage {
 	text: string;
 	replyToMessageId?: string;
 	replyToText?: string;
+	/** 处理中表情：reaction_id（add 时返回）。 */
+	reactionId?: string;
+	emojiReactionId?: string;
 }
 
 const MAX_QUEUE = 50;
@@ -82,6 +90,12 @@ export class ConversationManager {
 			replyToMessageId: msg.replyToMessageId,
 			replyToText: msg.replyToText,
 		};
+		// 处理中表情（hermes 式）：入队即添加，runOne 结束后撤回
+		if (this.deps.config.reaction.enabled && this.deps.reactions) {
+			const reactionId = await this.deps.reactions.add(msg.messageId, this.deps.config.reaction.processingEmoji);
+			queued.reactionId = msg.messageId;
+			queued.emojiReactionId = reactionId ?? "";
+		}
 		if (sess.queue.length >= MAX_QUEUE) {
 			this.deps.log?.("warn", "feishu.conv.queue_full", { chatId: key });
 			await this.notify(key, "消息过多，当前队列已满，请稍后再试。");
@@ -125,8 +139,16 @@ export class ConversationManager {
 				if (sentFromEvent || !text.trim()) return;
 				sentFromEvent = true;
 				try {
-					await this.deps.sender.send(sess.chatId, text.trim(), {
+					const res = await this.deps.sender.send(sess.chatId, text.trim(), {
 						replyTo: sess.lastReplyId ?? item.replyToMessageId,
+					});
+					this.deps.log?.("info", "feishu.conv.reply_sent", {
+						chatId: sess.chatId,
+						success: res.success,
+						messageId: res.messageId,
+						error: res.error,
+						fallback: res.fallback,
+						textLen: text.trim().length,
 					});
 				} catch (err) {
 					this.deps.log?.("error", "feishu.conv.send_error", {
@@ -136,6 +158,10 @@ export class ConversationManager {
 				}
 			};
 			sess.agent.subscribe((ev) => {
+				this.deps.log?.("debug", "feishu.conv.event", {
+					chatId: sess.chatId,
+					type: (ev as { type?: string })?.type ?? "?",
+				});
 				const e = ev as {
 					type?: string;
 					delta?: string;
@@ -151,6 +177,12 @@ export class ConversationManager {
 					}
 				} else if (e.type === "message_end") {
 					const text = extractText(e.message?.content ?? e.content);
+					this.deps.log?.("debug", "feishu.conv.message_end_extract", {
+						chatId: sess.chatId,
+						textLen: text?.length ?? 0,
+						hasMessage: Boolean(e.message),
+						hasContent: Boolean(e.content),
+					});
 					if (text) void sendReply(text);
 				}
 			});
@@ -169,8 +201,14 @@ export class ConversationManager {
 			// 兜底：事件通道未送出则用累积流式文本/返回值
 			if (!sentFromEvent) {
 				const text = streamedText.trim() || extractAssistantText(result);
+				this.deps.log?.("debug", "feishu.conv.fallback_send", {
+					chatId: sess.chatId,
+					streamedLen: streamedText.length,
+					fallbackLen: text?.length ?? 0,
+				});
 				if (text) await sendReply(text);
 			}
+			await this.removeProcessingReaction(sess, item);
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			if (msg === "run timeout") {
@@ -179,6 +217,15 @@ export class ConversationManager {
 				this.deps.log?.("error", "feishu.conv.run_error", { chatId: sess.chatId, error: msg });
 				await this.notify(sess.chatId, `处理出错：${msg.slice(0, 200)}`);
 			}
+		}
+	}
+
+	private async removeProcessingReaction(sess: BridgeSession, item: QueuedMessage): Promise<void> {
+		if (!this.deps.reactions || !item.messageId || !item.emojiReactionId) return;
+		try {
+			await this.deps.reactions.remove(item.messageId, item.emojiReactionId);
+		} catch {
+			/* ignore */
 		}
 	}
 

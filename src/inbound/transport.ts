@@ -194,6 +194,43 @@ export class FeishuTransport {
 		return this.client.request({ ...opts, method: opts.method });
 	}
 
+	/** 添加表情回应（hermes 式"处理中"指示）：POST reactions。返回 reaction_id。 */
+	async addReaction(messageId: string, emoji: string): Promise<string | undefined> {
+		try {
+			const res = (await this.authedRequest({
+				url: `/open-apis/im/v1/messages/${messageId}/reactions`,
+				method: "POST",
+				data: { reaction_type: { emoji_type: emoji } },
+			})) as Record<string, unknown>;
+			const data = (res?.data ?? res) as Record<string, unknown>;
+			const reactionId = typeof data?.reaction_id === "string" ? data.reaction_id : undefined;
+			return reactionId;
+		} catch (err) {
+			this.deps.log?.("debug", "feishu.transport.reaction_add_failed", {
+				messageId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return undefined;
+		}
+	}
+
+	/** 移除表情回应（处理完成）。 */
+	async removeReaction(messageId: string, reactionId: string): Promise<boolean> {
+		try {
+			await this.authedRequest({
+				url: `/open-apis/im/v1/messages/${messageId}/reactions/${reactionId}`,
+				method: "DELETE",
+			});
+			return true;
+		} catch (err) {
+			this.deps.log?.("debug", "feishu.transport.reaction_remove_failed", {
+				messageId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	}
+
 	/** REST 出站原语（sender 复用同一 client）。 */
 	async rawRequest(opts: { url: string; method: string; params?: unknown; data?: unknown }): Promise<unknown> {
 		if (!this.client) throw new Error("transport not started");
