@@ -112,6 +112,7 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 
 		convManager = new ConversationManager({
 			config,
+			sessionDir: paths.sessionDir,
 			sessionBackend: new PiSessionBackend({ sessionDir: paths.sessionDir, log: (l, m, x) => log[l](m, x) }),
 			sender,
 			log: (level, m, meta) => log[level](m, meta),
