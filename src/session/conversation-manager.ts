@@ -2,11 +2,14 @@
  * 会话管理器：Map<conversationKey, BridgeSession>，每 chat 独立 session/queue/activeRun。
  * 设计依据：docs/DESIGN.md §2.2（B3 根治：pi-remote-feishu ConversationRouter 思想）。
  */
+import { join } from "node:path";
 import type { BridgeConfig, FeishuInboundMessage, SessionBackend } from "../types.js";
 import type { Sender } from "../outbound/sender.js";
 
 export interface ConversationManagerDeps {
 	config: BridgeConfig;
+	/** 会话文件目录（绝对路径；避免相对路径落在 /workspace 无权限）。 */
+	sessionDir: string;
 	sessionBackend: SessionBackend;
 	sender: Sender;
 	/** agent 回复文本的发送器（默认 sender.send 到 chat，回复挂 bot 上一条消息）。 */
@@ -65,7 +68,7 @@ export class ConversationManager {
 			sess = {
 				conversationKey: key,
 				chatId: key,
-				sessionFile: `${this.deps.config.sessionDir}/${key}.jsonl`,
+				sessionFile: join(this.deps.sessionDir, `${key}.jsonl`),
 				queue: [],
 				activeRun: false,
 				createdAt: this.now(),
