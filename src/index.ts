@@ -115,6 +115,7 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			sessionDir: paths.sessionDir,
 			sessionBackend: new PiSessionBackend({ sessionDir: paths.sessionDir, log: (l, m, x) => log[l](m, x) }),
 			sender,
+			lastSent,
 			reactions: {
 				add: (messageId, emoji) => transport!.addReaction(messageId, emoji),
 				remove: (messageId, reactionId) => transport!.removeReaction(messageId, reactionId),

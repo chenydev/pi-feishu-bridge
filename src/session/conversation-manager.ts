@@ -12,6 +12,8 @@ export interface ConversationManagerDeps {
 	sessionDir: string;
 	sessionBackend: SessionBackend;
 	sender: Sender;
+	/** 本 bot 最近已发消息缓存（回复"自己消息"判定，hermes reply_to_is_own_message 等价）。 */
+	lastSent?: { has(messageId: string): boolean };
 	/** 处理中表情（reaction）能力：入队时添加、回复发出后撤回。 */
 	reactions?: {
 		add(messageId: string, emoji: string): Promise<string | undefined>;
@@ -191,15 +193,16 @@ export class ConversationManager {
 				}
 			});
 
-			// 组装提示词（回复链路可见性：B1）
-			// 自然引用块格式（实测：显式"系统提示"字样会被 deepseek 复述进回复）
+			// 组装提示词（回复链路可见性：B1）——对齐 hermes 的回复注入格式：
+			// `[Replying to: "原文"]` 方括号元信息（非对话内容，模型不易复述）；
+			// 区分回复自己消息 vs 回复他人消息；原文截断 500、占位转 @。
 			let prompt = item.text;
 			if (item.replyToMessageId && item.replyToText) {
-				const quote = item.replyToText
-					.slice(0, 500)
-					.replace(/@_user_\w+/g, "@")
-					.replace(/\n/g, "\n> ");
-				prompt = `> ${quote}\n\n${item.text}`;
+				const quote = item.replyToText.slice(0, 500).replace(/@_user_\w+/g, "@").replace(/\n/g, " ");
+				const replyingToSelf = Boolean(this.deps.lastSent?.has(item.replyToMessageId));
+				prompt = replyingToSelf
+					? `[你正在回复自己上一条消息，原文："${quote}"]\n\n${item.text}`
+					: `[正在回复的消息原文："${quote}"]\n\n${item.text}`;
 			}
 			this.lastQuoteBlock = prompt;
 
@@ -267,10 +270,13 @@ export function stripInjectedPrompt(text: string, quoteBlock: string): string {
 	let out = text;
 	// 精确剥离本次注入块（若被完整复述）
 	if (quoteBlock && out.includes(quoteBlock)) out = out.replace(quoteBlock, "");
-	// 兜底：剥离开头引用块行（> ...）
+	// 兜底：剥离开头引用块行（> ...）及其后空行
 	out = out.replace(/^(> [^\n]*\n?)+/, "");
-	// 兜底：剥离引用引导句
+	out = out.replace(/^\n+/, "");
+	// 兜底：剥离 hermes 式回复注入残留（[正在回复…] / [你正在回复…] / 旧格式引导句）
+	out = out.replace(/^\[(?:正在回复|你正在回复)[^\]]*\]\s*\n?/, "");
 	out = out.replace(/^(以下是用户回复[^\n]*\n?)+/, "");
+	out = out.replace(/^\[系统提示[^\]]*\]\s*\n?/, "");
 	return out.trim();
 }
 
