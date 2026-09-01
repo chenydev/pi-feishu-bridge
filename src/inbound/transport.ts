@@ -161,7 +161,9 @@ export class FeishuTransport {
 			const items = Array.isArray(data?.items) ? (data.items as Array<Record<string, unknown>>) : undefined;
 			const msg = (items?.[0] ?? data?.message ?? data) as Record<string, unknown> | undefined;
 			if (!msg) return undefined;
-			const content = typeof msg.content === "string" ? msg.content : undefined;
+			// 实测（2026-09-02）：content 在 body.content（嵌套 JSON），顶层 content 缺失
+			const body = (msg.body ?? {}) as Record<string, unknown>;
+			const content = typeof msg.content === "string" ? msg.content : typeof body.content === "string" ? body.content : undefined;
 			if (!content) return undefined;
 			try {
 				const parsed = JSON.parse(content) as Record<string, unknown>;

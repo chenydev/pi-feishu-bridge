@@ -188,9 +188,11 @@ export class ConversationManager {
 			});
 
 			// 组装提示词（回复链路可见性：B1）
+			// 引用块格式 + 明确"不要复述提示"——实测模型会复述旧格式提示词。
 			let prompt = item.text;
 			if (item.replyToMessageId && item.replyToText) {
-				prompt = `用户回复了消息（原文：${item.replyToText.slice(0, 500)}）：\n${prompt}`;
+				const quote = item.replyToText.slice(0, 500).replace(/\n/g, "\n> ");
+				prompt = `> ${quote}\n\n[系统提示：用户回复了上面的消息。请直接回复用户的新消息，不要复述本条提示。]\n\n${item.text}`;
 			}
 
 			const timeout = new Promise<never>((_, reject) =>
