@@ -80,10 +80,16 @@ export class ConversationManager {
 	 */
 	async route(msg: FeishuInboundMessage): Promise<void> {
 		// 会话 key（对齐 hermes build_session_key）：
-		// - 私聊：chatId（= p2p chat）
-		// - 群普通消息：chatId
-		// - 话题消息：chatId + threadId → 话题独立会话（hermes：thread_id 参与 key）
-		const key = msg.threadId ? `${msg.chatId}:t:${msg.threadId}` : msg.chatId;
+		// 1. 话题消息：chatId:t:threadId → 话题独立会话（thread_sessions_per_user=false：
+		//    话题内所有参与者共享同一话题会话——B 回复 A 的话题消息复用同一上下文）
+		// 2. 群普通消息：groupSessionsPerUser=true → chatId:u:senderId
+		//    （B 在主聊天发无关联新消息 → B 自己的新会话）
+		// 3. 私聊：chatId（p2p chat）
+		const key = msg.threadId
+			? `${msg.chatId}:t:${msg.threadId}`
+			: msg.chatType === "group" && this.deps.config.groupSessionsPerUser
+				? `${msg.chatId}:u:${msg.senderId || "unknown"}`
+				: msg.chatId;
 		let sess = this.sessions.get(key);
 		if (!sess) {
 			sess = {

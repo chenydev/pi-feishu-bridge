@@ -32,6 +32,9 @@ export interface BridgeConfig {
 	admins: string[];
 	/** mention 策略下，回复 bot 消息（parent 命中本 bot 已发缓存）免 @ */
 	groupAlsoOnReply: boolean;
+	/** 群内普通消息按用户隔离会话（hermes group_sessions_per_user 默认 true）；
+	 * 话题内始终共享话题会话（thread_sessions_per_user=false 等价）。 */
+	groupSessionsPerUser: boolean;
 	requireMention: boolean;
 
 	batch: BatchConfig;
@@ -58,6 +61,7 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 	allowUsers: [],
 	admins: [],
 	groupAlsoOnReply: true,
+	groupSessionsPerUser: true,
 	requireMention: true,
 	batch: { enabled: true, textWindowMs: 3000 },
 	forwarding: { acceptMergeForward: true },
