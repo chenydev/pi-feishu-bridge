@@ -134,8 +134,8 @@ test("每群规则：policy/requireMention/allowlist 逐字段继承", () => {
 	assert.equal(requireMentionForChat(c3, "oc_y"), true);
 	// blacklist 策略 + 每群 blacklist
 	const c4 = cfg({ groupPolicy: "blacklist", groupRules: { oc_x: { blacklist: ["ou_bad"] } } });
-	assert.equal(admit(c4, groupMsg({ senderId: "ou_bad" }), true, false, new LastSentCache(8)).ok, false);
-	assert.equal(admit(c4, groupMsg({ senderId: "ou_ok" }), true, false, new LastSentCache(8)).ok, true);
+	assert.equal(admit(c4, groupMsg({ senderId: "ou_bad", chatId: "oc_x" }), true, false, new LastSentCache(8)).ok, false);
+	assert.equal(admit(c4, groupMsg({ senderId: "ou_ok", chatId: "oc_x" }), true, false, new LastSentCache(8)).ok, true);
 	// admin_only 策略
 	const c5 = cfg({ groupPolicy: "admin_only", admins: ["ou_admin"] });
 	assert.equal(admit(c5, groupMsg({ senderId: "ou_admin" }), false, false, new LastSentCache(8)).ok, true);
