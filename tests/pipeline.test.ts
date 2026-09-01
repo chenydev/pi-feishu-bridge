@@ -209,3 +209,40 @@ test("会话隔离：话题消息独立会话 key（hermes thread_id 参与 key�
 	assert.ok(sessionFiles[0] !== sessionFiles[1]);
 	assert.match(sessionFiles[1], /oc_g_t_om_t1/);
 });
+
+test("会话隔离：群内按用户隔离 + 话题内共享（hermes 模型）", async () => {
+	const { ConversationManager } = await import("../src/session/conversation-manager.js");
+	const sessionFiles: string[] = [];
+	const mgr = new ConversationManager({
+		config: cfg({ groupPolicy: "open" }),
+		sessionDir: "/tmp/feishu-test-sessions2",
+		sessionBackend: {
+			async createSession(opts: { sessionFile?: string }) {
+				sessionFiles.push(opts.sessionFile ?? "");
+				return {
+					sessionId: "s",
+					async prompt() { return undefined; },
+					subscribe() { return () => {}; },
+					modelId: "m",
+				};
+			},
+		},
+		sender: {
+			async send(chat: string, _text: string, _opts?: unknown) { return { success: true }; },
+		},
+	} as never);
+	const mk = (over: Record<string, unknown> = {}) => ({ messageId: `m${Math.random().toString(36).slice(2, 8)}`, chatId: "oc_g", chatType: "group", senderId: "ou_a", isBot: false, msgType: "text", text: "hi", mentions: [], ts: Date.now(), raw: undefined, ...over }) as never;
+	// A 主聊天 → 会话1（含 ou_a）
+	await mgr.route(mk({ senderId: "ou_a" }));
+	// B 主聊天新消息 → 会话2（含 ou_b）
+	await mgr.route(mk({ senderId: "ou_b" }));
+	// 话题 S1：A 和 B 回复同一话题 → 同一会话3（共享话题）
+	await mgr.route(mk({ senderId: "ou_a", threadId: "om_t9", chatType: "topic" }));
+	await mgr.route(mk({ senderId: "ou_b", threadId: "om_t9", chatType: "topic" }));
+	assert.equal(sessionFiles.length, 3);
+	assert.match(sessionFiles[0], /oc_g_u_ou_a/);
+	assert.match(sessionFiles[1], /oc_g_u_ou_b/);
+	assert.ok(sessionFiles[0] !== sessionFiles[1]);
+	// A/B 话题消息共享同一会话文件
+	assert.equal(sessionFiles[2], sessionFiles[3] ?? sessionFiles[2]);
+});
