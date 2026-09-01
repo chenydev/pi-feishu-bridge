@@ -187,7 +187,7 @@ test("会话隔离：话题消息独立会话 key（hermes thread_id 参与 key�
 		config: cfg({ groupPolicy: "open" }),
 		sessionDir: "/tmp/feishu-test-sessions",
 		sessionBackend: {
-			async createSession(opts) {
+			async createSession(opts: { sessionFile?: string }) {
 				sessionFiles.push(opts.sessionFile ?? "");
 				return {
 					sessionId: "s",
