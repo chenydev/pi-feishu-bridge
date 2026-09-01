@@ -178,7 +178,7 @@ export class ConversationManager {
 					type?: string;
 					delta?: string;
 					assistantMessageEvent?: { type?: string; delta?: string };
-					message?: { content?: unknown; id?: string };
+					message?: { role?: string; content?: unknown; id?: string };
 					content?: unknown;
 				};
 				if (e.type === "message_update") {
