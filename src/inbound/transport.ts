@@ -20,7 +20,7 @@ export interface LarkSdkDispatcher {
 
 export interface LarkSdkWsClient {
 	start(opts: { eventDispatcher: LarkSdkDispatcher }): void;
-	stop(): Promise<void>;
+	close(params?: { force?: boolean }): void;
 }
 
 export interface LarkSdkLike {
@@ -65,11 +65,17 @@ export class FeishuTransport {
 	private reconnectCount = 0;
 	private botIdentity: BotIdentity = {};
 	private probeCache: { at: number; identity: BotIdentity } | undefined;
+	/** 最近一次 start() 的时间戳：上层 watchdog 据此宽限握手期，避免误判重连。 */
+	private connectStartedAt = 0;
 
 	constructor(private deps: TransportDeps) {}
 
 	getBotIdentity(): BotIdentity {
 		return this.botIdentity;
+	}
+
+	getConnectStartedAt(): number {
+		return this.connectStartedAt;
 	}
 
 	isConnected(): boolean {
@@ -84,6 +90,7 @@ export class FeishuTransport {
 		if (this.running) return;
 		const { sdk, config } = this.deps;
 		const domain = config.domain === "lark" ? sdk.Domain.Lark : sdk.Domain.Feishu;
+		this.closeWs();
 		this.client = new sdk.Client({ appId: config.appId, appSecret: config.appSecret, appType: 0, domain });
 
 		// bot 身份水合（hermes 设计：不依赖 env/时序；失败不阻塞启动，降级为空）
@@ -107,6 +114,7 @@ export class FeishuTransport {
 			autoReconnect: false,
 			onReady: () => {
 				this.wsReady = true;
+				this.connectStartedAt = 0;
 				this.reconnectCount = 0;
 				this.deps.onStatus?.("connected", this.reconnectCount);
 				this.deps.log?.("info", "feishu.transport.ws_ready");
@@ -120,6 +128,7 @@ export class FeishuTransport {
 			},
 		});
 		this.running = true;
+		this.connectStartedAt = Date.now();
 		try {
 			this.wsClient.start({ eventDispatcher: dispatcher });
 		} catch (err) {
@@ -131,8 +140,13 @@ export class FeishuTransport {
 	async stop(): Promise<void> {
 		this.running = false;
 		this.wsReady = false;
+		this.closeWs();
+	}
+
+	/** 关闭当前 WSClient（close({force}) 真正断连；旧版 SDK 的 stop 不存在 → 泄漏）。 */
+	private closeWs(): void {
 		try {
-			await this.wsClient?.stop();
+			this.wsClient?.close({ force: true });
 		} catch {
 			/* ignore */
 		}
