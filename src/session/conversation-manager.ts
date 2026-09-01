@@ -42,6 +42,8 @@ interface QueuedMessage {
 	text: string;
 	replyToMessageId?: string;
 	replyToText?: string;
+	/** 话题（thread_id）透传：hermes 话题模式。 */
+	threadId?: string;
 	/** 处理中表情：reaction_id（add 时返回）。 */
 	reactionId?: string;
 	emojiReactionId?: string;
@@ -93,6 +95,7 @@ export class ConversationManager {
 			text: msg.text,
 			replyToMessageId: msg.replyToMessageId,
 			replyToText: msg.replyToText,
+			threadId: msg.threadId,
 		};
 		// 处理中表情（hermes 式）：入队即添加，runOne 结束后撤回
 		if (this.deps.config.reaction.enabled && this.deps.reactions) {
@@ -151,8 +154,10 @@ export class ConversationManager {
 						this.deps.log?.("debug", "feishu.conv.empty_after_strip", { chatId: sess.chatId });
 						return;
 					}
+					// 回复挂用户消息（hermes: reply_to = source.message_id）
 					const res = await this.deps.sender.send(sess.chatId, cleaned, {
-						replyTo: sess.lastReplyId ?? item.replyToMessageId,
+						replyTo: item.messageId,
+						threadId: item.threadId,
 					});
 					this.deps.log?.("info", "feishu.conv.reply_sent", {
 						chatId: sess.chatId,
