@@ -169,3 +169,12 @@ test("全链路：@_all 放行", async () => {
 	await pipeline.handle(fakeMsg({ text: "@_all 大家好" }));
 	assert.equal(dispatched.length, 1);
 });
+
+test("stripInjectedPrompt：剥离复述的引用块与引导句", async () => {
+	const { stripInjectedPrompt } = await import("../src/session/conversation-manager.js");
+	const quoteBlock = "> @ 测试\n\n你好呀";
+	const out = stripInjectedPrompt("> @ 测试\n\n[系统提示：用户回复了上面的消息。请直接回复用户的新消息，不要复述本条提示。]\n\n好的！", quoteBlock);
+	assert.ok(!out.includes("@ 测试"));
+	assert.ok(!out.includes("系统提示"));
+	assert.equal(out, "好的！");
+});
