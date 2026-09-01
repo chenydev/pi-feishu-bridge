@@ -2,9 +2,22 @@
  * 会话管理器：Map<conversationKey, BridgeSession>，每 chat 独立 session/queue/activeRun。
  * 设计依据：docs/DESIGN.md §2.2（B3 根治：pi-remote-feishu ConversationRouter 思想）。
  */
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { BridgeConfig, FeishuInboundMessage, SessionBackend } from "../types.js";
 import type { Sender } from "../outbound/sender.js";
+
+/** pending 中断恢复文件（hermes resume_pending 简化版）：agent 运行中进程被杀，
+ * 重启后据此重发未完成消息。 */
+interface PendingEntry {
+	chatId: string;
+	messageId: string;
+	text: string;
+	threadId?: string;
+	replyToMessageId?: string;
+	replyToText?: string;
+	ts: number;
+}
 
 export interface ConversationManagerDeps {
 	config: BridgeConfig;
@@ -24,6 +37,8 @@ export interface ConversationManagerDeps {
 	/** 超时（默认 300s）后通知用户并释放。 */
 	runTimeoutMs?: number;
 	now?: () => number;
+	/** pending 中断恢复文件路径（hermes resume_pending；不设则禁用）。 */
+	pendingFile?: string;
 }
 
 interface BridgeSession {
@@ -41,6 +56,7 @@ interface BridgeSession {
 }
 
 interface QueuedMessage {
+	chatId: string;
 	messageId: string;
 	text: string;
 	replyToMessageId?: string;
@@ -60,10 +76,83 @@ export class ConversationManager {
 	private now: () => number;
 	/** 最近一次注入的引用块（发送前清洗模型复述用）。 */
 	private lastQuoteBlock = "";
+	private readonly pendingFile: string;
+	private readonly pendingEnabled: boolean;
 
 	constructor(private deps: ConversationManagerDeps) {
 		this.runTimeoutMs = deps.runTimeoutMs ?? 300_000;
 		this.now = deps.now ?? Date.now;
+		this.pendingFile = deps.pendingFile ?? "";
+		this.pendingEnabled = Boolean(deps.pendingFile);
+	}
+
+	/** 启动时恢复上次中断的未完成消息（hermes resume_pending）。 */
+	async recoverPending(): Promise<number> {
+		if (!this.pendingEnabled) return 0;
+		let entries: PendingEntry[] = [];
+		try {
+			if (existsSync(this.pendingFile)) {
+				entries = readFileSync(this.pendingFile, "utf8").split("\n").filter(Boolean).map((l) => {
+					try { return JSON.parse(l) as PendingEntry; } catch { return undefined; }
+				}).filter((e): e is PendingEntry => Boolean(e));
+			}
+		} catch {
+			return 0;
+		}
+		try {
+			writeFileSync(this.pendingFile, "", "utf8"); // 清空，避免恢复过程中重复入队
+		} catch {
+			/* ignore */
+		}
+		for (const e of entries) {
+			this.deps.log?.("warn", "feishu.conv.recover_pending", { chatId: e.chatId, messageId: e.messageId });
+			const msg: FeishuInboundMessage = {
+				messageId: e.messageId,
+				chatId: e.chatId,
+				chatType: "group",
+				senderId: "",
+				isBot: false,
+				msgType: "text",
+				text: e.text,
+				mentions: [],
+				replyToMessageId: e.replyToMessageId,
+				replyToText: e.replyToText,
+				threadId: e.threadId,
+				raw: undefined,
+				ts: e.ts,
+			};
+			await this.route(msg);
+		}
+		return entries.length;
+	}
+
+	private markPending(item: QueuedMessage): void {
+		if (!this.pendingEnabled) return;
+		try {
+			mkdirSync(dirname(this.pendingFile), { recursive: true });
+			const entry: PendingEntry = {
+				chatId: item.chatId, messageId: item.messageId, text: item.text,
+				threadId: item.threadId, replyToMessageId: item.replyToMessageId, replyToText: item.replyToText,
+				ts: Date.now(),
+			};
+			writeFileSync(this.pendingFile, JSON.stringify(entry) + "\n", { flag: "a" });
+		} catch {
+			/* ignore */
+		}
+	}
+
+	private clearPending(item: QueuedMessage): void {
+		if (!this.pendingEnabled) return;
+		try {
+			if (!existsSync(this.pendingFile)) return;
+			const lines = readFileSync(this.pendingFile, "utf8").split("\n").filter(Boolean);
+			const rest = lines.filter((l) => {
+				try { return (JSON.parse(l) as PendingEntry).messageId !== item.messageId; } catch { return false; }
+			});
+			writeFileSync(this.pendingFile, rest.length ? rest.join("\n") + "\n" : "", "utf8");
+		} catch {
+			/* ignore */
+		}
 	}
 
 	count(): number {
@@ -105,6 +194,7 @@ export class ConversationManager {
 		}
 
 		const queued: QueuedMessage = {
+			chatId: msg.chatId,
 			messageId: msg.messageId,
 			text: msg.text,
 			replyToMessageId: msg.replyToMessageId,
@@ -142,6 +232,7 @@ export class ConversationManager {
 	}
 
 	private async runOne(sess: BridgeSession, item: QueuedMessage): Promise<void> {
+		this.markPending(item);
 		try {
 			if (!sess.agent) {
 				sess.agent = await this.deps.sessionBackend.createSession({
@@ -255,7 +346,9 @@ export class ConversationManager {
 				if (text) await sendReply(text);
 			}
 			await this.removeProcessingReaction(sess, item);
+			this.clearPending(item);
 		} catch (err) {
+			this.clearPending(item);
 			const msg = err instanceof Error ? err.message : String(err);
 			if (msg === "run timeout") {
 				await this.notify(sess.chatId, "任务处理超时已中止，请重试。");

@@ -77,6 +77,27 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 		}
 	}
 	const csv = (v: string | undefined): string[] => (v ? v.split(",").map((s) => s.trim()).filter(Boolean) : []);
+	if (env.FEISHU_GROUP_RULES) {
+		try {
+			const parsed = JSON.parse(env.FEISHU_GROUP_RULES) as Record<string, unknown>;
+			const clean: Record<string, import("./types.js").GroupRule> = {};
+			for (const [k, v] of Object.entries(parsed)) {
+				if (v && typeof v === "object") {
+					const r = v as Record<string, unknown>;
+					const rule: import("./types.js").GroupRule = {};
+					const p = parseGroupPolicy(r.policy);
+					if (p) rule.policy = p;
+					if (Array.isArray(r.allowlist)) rule.allowlist = r.allowlist.map(String);
+					if (Array.isArray(r.blacklist)) rule.blacklist = r.blacklist.map(String);
+					if (typeof r.requireMention === "boolean") rule.requireMention = r.requireMention;
+					clean[k] = rule;
+				}
+			}
+			merged.groupRules = clean;
+		} catch {
+			/* 忽略非法 env JSON */
+		}
+	}
 	if (env.FEISHU_ALLOW_CHATS) merged.allowChats = csv(env.FEISHU_ALLOW_CHATS);
 	if (env.FEISHU_ALLOW_USERS) merged.allowUsers = csv(env.FEISHU_ALLOW_USERS);
 	if (env.FEISHU_ADMINS) merged.admins = csv(env.FEISHU_ADMINS);
