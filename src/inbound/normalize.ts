@@ -282,12 +282,8 @@ export function normalizeFeishuMessage(input: NormalizeInput): FeishuInboundMess
 	}
 
 	const mentions = buildMentionsMap(input.mentions, input.bot);
-	// mention 提示前缀（群消息有 @ 时让 agent 知道被谁 @）
-	const hint = mentions.filter((m) => m.isSelf && m.name).map((m) => `@${m.name}`).join(" ");
-	let finalText = stripEdgeSelfMentions(text, mentions);
-	if (hint && msgType === "text" && finalText) {
-		finalText = `（${hint}）${finalText}`;
-	}
+	// 用户反馈：注入 mention 前缀（（@飞书 CLI））显得奇怪；只剥离 @ 占位，不注入前缀。
+	const finalText = stripEdgeSelfMentions(text, mentions);
 
 	const sender = (input.sender ?? {}) as Record<string, unknown>;
 	const senderIdObj = (sender.sender_id ?? {}) as Record<string, string>;
