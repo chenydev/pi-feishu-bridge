@@ -186,10 +186,15 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		}, delay);
 	}
 
-	// 轮询监督（1s）：WS 掉线且未在重连 → 调度重连。
+	// 轮询监督（1s）：WS 掉线且已过握手宽限期（15s）未恢复 → 调度重连。
+	// 宽限期避免首次启动时 watchdog 在 SDK 握手完成前误判掉线（触发多余重连）。
+	const HAND_SHAKE_GRACE_MS = 15_000;
 	const watchdog = setInterval(() => {
 		if (started && !stopping && transport?.isRunning() && !transport?.isConnected() && !reconnectTimer) {
-			scheduleReconnect();
+			const connectingSince = transport.getConnectStartedAt();
+			if (connectingSince === 0 || Date.now() - connectingSince > HAND_SHAKE_GRACE_MS) {
+				scheduleReconnect();
+			}
 		}
 	}, 1_000);
 	watchdog.unref?.();
