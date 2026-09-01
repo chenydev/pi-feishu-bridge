@@ -145,6 +145,11 @@ export class ConversationManager {
 				try {
 					// 模型偶发复述注入的引用块/提示：剥离后发送
 					const cleaned = stripInjectedPrompt(text, this.lastQuoteBlock);
+					if (!cleaned.trim()) {
+						// 纯引用残留（无实际内容）：静默跳过，不报错
+						this.deps.log?.("debug", "feishu.conv.empty_after_strip", { chatId: sess.chatId });
+						return;
+					}
 					const res = await this.deps.sender.send(sess.chatId, cleaned, {
 						replyTo: sess.lastReplyId ?? item.replyToMessageId,
 					});
