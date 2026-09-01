@@ -275,6 +275,9 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			return;
 		}
 		await startBridge();
+		// 网关重启恢复：重发上次中断的未完成消息（hermes resume_pending）
+		const recovered = await convManager?.recoverPending() ?? 0;
+		if (recovered > 0) log.warn("bridge recovered pending messages", { count: recovered });
 	});
 
 	pi.on("session_shutdown", async () => {

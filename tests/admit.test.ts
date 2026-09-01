@@ -3,7 +3,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { admit, LastSentCache, policyForChat } from "../src/inbound/admit.js";
+import { admit, LastSentCache, policyForChat, requireMentionForChat } from "../src/inbound/admit.js";
 import { DEFAULT_CONFIG, type BridgeConfig } from "../src/types.js";
 import type { FeishuInboundMessage } from "../src/types.js";
 
@@ -118,4 +118,26 @@ test("LastSentCache 容量淘汰", () => {
 	assert.equal(cache.has("a"), false);
 	assert.equal(cache.has("b"), true);
 	assert.equal(cache.has("c"), true);
+});
+
+test("每群规则：policy/requireMention/allowlist 逐字段继承", () => {
+	// 规则未配置字段 → 继承全局
+	const c = cfg({ groupPolicy: "open", requireMention: true });
+	assert.equal(policyForChat(c, "oc_unconfigured"), "open");
+	// 规则覆盖 policy
+	const c2 = cfg({ groupPolicy: "mention", groupRules: { oc_x: { policy: "open" } } });
+	assert.equal(policyForChat(c2, "oc_x"), "open");
+	assert.equal(policyForChat(c2, "oc_y"), "mention"); // 未配置沿用主配置
+	// rule.requireMention 字段级继承
+	const c3 = cfg({ requireMention: true, groupRules: { oc_x: { requireMention: false } } });
+	assert.equal(requireMentionForChat(c3, "oc_x"), false);
+	assert.equal(requireMentionForChat(c3, "oc_y"), true);
+	// blacklist 策略 + 每群 blacklist
+	const c4 = cfg({ groupPolicy: "blacklist", groupRules: { oc_x: { blacklist: ["ou_bad"] } } });
+	assert.equal(admit(c4, groupMsg({ senderId: "ou_bad" }), true, false, new LastSentCache(8)).ok, false);
+	assert.equal(admit(c4, groupMsg({ senderId: "ou_ok" }), true, false, new LastSentCache(8)).ok, true);
+	// admin_only 策略
+	const c5 = cfg({ groupPolicy: "admin_only", admins: ["ou_admin"] });
+	assert.equal(admit(c5, groupMsg({ senderId: "ou_admin" }), false, false, new LastSentCache(8)).ok, true);
+	assert.equal(admit(c5, groupMsg({ senderId: "ou_user" }), true, false, new LastSentCache(8)).ok, false);
 });

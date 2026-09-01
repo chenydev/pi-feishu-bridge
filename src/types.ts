@@ -5,7 +5,15 @@
 
 // ---------------------------------------------------------------- 配置 ----
 
-export type GroupPolicy = "open" | "mention" | "disabled" | "allowlist";
+export type GroupPolicy = "open" | "mention" | "disabled" | "allowlist" | "blacklist" | "admin_only";
+
+/** 每群规则（hermes FeishuGroupRule 对齐）：未配置字段继承全局。 */
+export interface GroupRule {
+	policy?: GroupPolicy;
+	allowlist?: string[];
+	blacklist?: string[];
+	requireMention?: boolean; // undefined = 继承全局
+}
 
 export interface BatchConfig {
 	enabled: boolean;
@@ -22,8 +30,12 @@ export interface BridgeConfig {
 	botName?: string;
 
 	groupPolicy: GroupPolicy;
-	/** 每群策略覆盖（优先于全局） */
+	/** 每群策略覆盖（优先于全局）——保留向后兼容 */
 	groupPolicyByChat: Record<string, GroupPolicy>;
+	/** 每群完整规则（hermes group_rules 对齐） */
+	groupRules: Record<string, GroupRule>;
+	/** 未配置规则群的兜底策略（hermes default_group_policy；空 = 用全局 groupPolicy） */
+	defaultGroupPolicy?: GroupPolicy;
 	/** 群白名单；空数组 = 全部群按策略 */
 	allowChats: string[];
 	/** DM 白名单；空 = 全部放行 */
@@ -57,6 +69,7 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 	domain: "feishu",
 	groupPolicy: "mention",
 	groupPolicyByChat: {},
+	groupRules: {},
 	allowChats: [],
 	allowUsers: [],
 	admins: [],
