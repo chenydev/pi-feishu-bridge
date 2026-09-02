@@ -49,11 +49,11 @@ function wrapInline(text: string, style: string[] | undefined): string {
 }
 
 export function renderTextElement(el: PostElement): string {
+	// 飞书 post <at>.user_id 的值就是占位符本身（"@_user_N" / "@_all"），
+	// 无 text 字段；由 resolveMentionPlaceholders 统一替换为真实名（hermes 对齐）。
+	if (el.tag === "at" && el.user_id) return el.user_id;
 	if (!el.text) return "";
 	if (el.tag === "a" && el.href) return `[${el.text}](${el.href})`;
-	// 飞书 post <at>.user_id 的值就是占位符本身（"@_user_N" / "@_all"），
-	// 不再拼前缀，由 resolveMentionPlaceholders 统一替换为真实名（hermes 对齐）。
-	if (el.tag === "at" && el.user_id) return el.user_id;
 	return wrapInline(el.text, el.style);
 }
 
