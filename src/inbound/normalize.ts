@@ -171,14 +171,12 @@ export function buildMentionsMap(mentions: unknown[] | undefined, bot: BotIdenti
 	const refs: FeishuMentionRef[] = [];
 	for (const raw of mentions) {
 		const m = extractMentionIds(raw);
-		let isSelf = false;
-		if (m.open_id && bot.openId) {
-			isSelf = m.open_id === bot.openId;
-		} else if (m.user_id && bot.userId) {
-			isSelf = m.user_id === bot.userId;
-		} else if (m.name && bot.name) {
-			isSelf = m.name === bot.name;
-		}
+		// hermes bot.matches：open_id OR user_id OR name 任一匹配即算自身提及
+		// （聚合群转发消息里 @_user_1 的 open_id 可能是同名其他应用，name 兜底）
+		const isSelf =
+			(m.open_id !== undefined && m.open_id === bot.openId) ||
+			(m.user_id !== undefined && m.user_id === bot.userId) ||
+			(m.name !== undefined && m.name === bot.name);
 		refs.push({ key: m.key, id: { open_id: m.open_id, user_id: m.user_id, union_id: m.union_id }, name: m.name, isSelf });
 	}
 	return refs;

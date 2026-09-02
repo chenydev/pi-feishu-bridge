@@ -55,9 +55,13 @@ test("mention 策略：回复非 bot 消息仍拒绝", () => {
 	assert.equal(admit(c, msg, false, false, cache).ok, false);
 });
 
-test("open 策略：全部放行", () => {
-	const c = cfg({ groupPolicy: "open" });
-	assert.equal(admit(c, groupMsg(), false, false, new LastSentCache(8)).ok, true);
+test("open 策略：策略层放行，但 mention 层仍检查（hermes 两层模型）", () => {
+	const c = cfg({ groupPolicy: "open" }); // requireMention 默认 true
+	assert.equal(admit(c, groupMsg(), true, false, new LastSentCache(8)).ok, true); // @ 放行
+	assert.equal(admit(c, groupMsg(), false, false, new LastSentCache(8)).ok, false); // 未 @ 拒绝
+	// requireMention=false 时 open 全放行
+	const c2 = cfg({ groupPolicy: "open", requireMention: false });
+	assert.equal(admit(c2, groupMsg(), false, false, new LastSentCache(8)).ok, true);
 });
 
 test("disabled 策略：全部拒绝", () => {
@@ -65,10 +69,14 @@ test("disabled 策略：全部拒绝", () => {
 	assert.equal(admit(c, groupMsg(), true, false, new LastSentCache(8)).ok, false);
 });
 
-test("管理员永远放行", () => {
+test("管理员也要 @（hermes：admin 只豁免策略层，不豁免 mention）", () => {
 	const c = cfg({ groupPolicy: "mention", admins: ["ou_admin"] });
 	const msg = groupMsg({ senderId: "ou_admin" });
-	assert.equal(admit(c, msg, false, false, new LastSentCache(8)).ok, true);
+	assert.equal(admit(c, msg, true, false, new LastSentCache(8)).ok, true); // @ 放行
+	assert.equal(admit(c, msg, false, false, new LastSentCache(8)).ok, false); // 未 @ 拒绝
+	// admin 豁免策略层：disabled/admin_only 下 admin 放行（mention 仍查）
+	const c2 = cfg({ groupPolicy: "admin_only", admins: ["ou_admin"] });
+	assert.equal(admit(c2, msg, true, false, new LastSentCache(8)).ok, true);
 });
 
 test("allowlist 策略：非白名单群拒绝", () => {
@@ -81,10 +89,11 @@ test("allowlist 策略：白名单群 + mention 放行", () => {
 	assert.equal(admit(c, groupMsg(), true, false, new LastSentCache(8)).ok, true);
 });
 
-test("groupPolicyByChat 覆盖全局（open）", () => {
+test("groupPolicyByChat 覆盖全局（open）——策略层 open 但仍需 @（mention 层独立）", () => {
 	const c = cfg({ groupPolicy: "mention", groupPolicyByChat: { oc_group: "open" } });
-	assert.equal(admit(c, groupMsg(), false, false, new LastSentCache(8)).ok, true);
 	assert.equal(policyForChat(c, "oc_group"), "open");
+	assert.equal(admit(c, groupMsg(), true, false, new LastSentCache(8)).ok, true); // @ 放行
+	assert.equal(admit(c, groupMsg(), false, false, new LastSentCache(8)).ok, false); // 未 @ 拒绝
 });
 
 test("DM：白名单空 = 全放行", () => {
@@ -136,8 +145,9 @@ test("每群规则：policy/requireMention/allowlist 逐字段继承", () => {
 	const c4 = cfg({ groupPolicy: "blacklist", groupRules: { oc_x: { blacklist: ["ou_bad"] } } });
 	assert.equal(admit(c4, groupMsg({ senderId: "ou_bad", chatId: "oc_x" }), true, false, new LastSentCache(8)).ok, false);
 	assert.equal(admit(c4, groupMsg({ senderId: "ou_ok", chatId: "oc_x" }), true, false, new LastSentCache(8)).ok, true);
-	// admin_only 策略
+	// admin_only 策略：admin 过策略层，但 mention 层仍要 @（hermes 两层模型）
 	const c5 = cfg({ groupPolicy: "admin_only", admins: ["ou_admin"] });
-	assert.equal(admit(c5, groupMsg({ senderId: "ou_admin" }), false, false, new LastSentCache(8)).ok, true);
+	assert.equal(admit(c5, groupMsg({ senderId: "ou_admin" }), true, false, new LastSentCache(8)).ok, true);
+	assert.equal(admit(c5, groupMsg({ senderId: "ou_admin" }), false, false, new LastSentCache(8)).ok, false);
 	assert.equal(admit(c5, groupMsg({ senderId: "ou_user" }), true, false, new LastSentCache(8)).ok, false);
 });

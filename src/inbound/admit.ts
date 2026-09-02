@@ -43,9 +43,10 @@ export function requireMentionForChat(cfg: BridgeConfig, chatId: string): boolea
 }
 
 /**
- * 准入判定。
- * @param mentioned 该消息是否提及 bot
- * @param replyToBot 是否回复了本 bot 最近发送的消息
+ * 准入判定（hermes _admit 两层模型对齐）：
+ * 1. 策略层（谁可以发）：admin 豁免；disabled/open/admin_only/allowlist/blacklist
+ * 2. mention 层（是否必须 @）：requireMention 默认 true，**admin 也要过**——
+ *    hermes 的 admin 只豁免策略层，不豁免 @ 检查。
  */
 export function admit(
 	cfg: BridgeConfig,
@@ -58,11 +59,7 @@ export function admit(
 	if (msg.isBot) return { ok: false, reason: "bots_disabled" };
 
 	const isGroup = msg.chatType !== "p2p";
-
-	// 2. 管理员（群内永远放行）
-	if (isGroup && cfg.admins.length > 0 && cfg.admins.includes(msg.senderId)) {
-		return { ok: true };
-	}
+	const isAdmin = isGroup && cfg.admins.length > 0 && cfg.admins.includes(msg.senderId);
 
 	if (!isGroup) {
 		// DM：白名单空 = 全部放行
@@ -70,33 +67,30 @@ export function admit(
 		return cfg.allowUsers.includes(msg.senderId) ? { ok: true } : { ok: false, reason: "dm_policy_rejected" };
 	}
 
-	// 3. 群消息（hermes _allow_group_message）
+	// ---- 策略层（hermes _allow_group_message；admin 豁免策略） ----
 	const rule = ruleForChat(cfg, msg.chatId);
 	const policy = policyForChat(cfg, msg.chatId);
-	// 用户白名单（仅规则字段；群白名单 allowChats 单独检查，不混用）
-	const allowlist = rule?.allowlist ?? [];
-	const blacklist = rule?.blacklist ?? [];
+	if (!isAdmin) {
+		if (policy === "disabled") return { ok: false, reason: "group_policy_rejected" };
+		if (policy === "open") { /* 策略层放行 */ }
+		else if (policy === "admin_only") {
+			return cfg.admins.includes(msg.senderId) ? { ok: true } : { ok: false, reason: "group_policy_rejected" };
+		} else if (policy === "allowlist") {
+			// 群白名单（allowChats 兼容层）+ 用户白名单（rule.allowlist）
+			if (cfg.allowChats.length > 0 && !cfg.allowChats.includes(msg.chatId)) {
+				return { ok: false, reason: "not_allowlisted" };
+			}
+			const allowlist = rule?.allowlist ?? [];
+			if (allowlist.length > 0 && !allowlist.includes(msg.senderId)) {
+				return { ok: false, reason: "not_allowlisted" };
+			}
+		} else if (policy === "blacklist") {
+			const blacklist = rule?.blacklist ?? [];
+			if (blacklist.includes(msg.senderId)) return { ok: false, reason: "group_policy_rejected" };
+		}
+	}
 
-	// 群白名单（allowChats 兼容层）：非白名单群在 allowlist 策略下直接拒收
-	if (policy === "allowlist") {
-		if (cfg.allowChats.length > 0 && !cfg.allowChats.includes(msg.chatId)) {
-			return { ok: false, reason: "not_allowlisted" };
-		}
-		if (allowlist.length > 0 && !allowlist.includes(msg.senderId)) {
-			return { ok: false, reason: "not_allowlisted" };
-		}
-		return checkMention(cfg, msg, mentioned, replyToBot);
-	}
-	if (policy === "blacklist") {
-		if (blacklist.includes(msg.senderId)) return { ok: false, reason: "group_policy_rejected" };
-		return checkMention(cfg, msg, mentioned, replyToBot);
-	}
-	if (policy === "admin_only") {
-		return cfg.admins.includes(msg.senderId) ? { ok: true } : { ok: false, reason: "group_policy_rejected" };
-	}
-	if (policy === "disabled") return { ok: false, reason: "group_policy_rejected" };
-	if (policy === "open") return { ok: true };
-	// mention 策略
+	// ---- mention 层（hermes：admin 也过 @ 检查） ----
 	return checkMention(cfg, msg, mentioned, replyToBot);
 }
 

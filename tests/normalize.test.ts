@@ -75,9 +75,9 @@ test("mention ID 匹配（open_id）", () => {
 	assert.equal(mentions[0].isSelf, true);
 });
 
-test("mention ID 不匹配时不做 name 兜底（双方都有 ID）", () => {
+test("mention ID 不匹配但 name 匹配 → isSelf（hermes OR 语义：同名其他应用兜底）", () => {
 	const mentions = buildMentionsMap([{ id: { open_id: "ou_other" }, name: "小助手" }], BOT);
-	assert.equal(mentions[0].isSelf, false);
+	assert.equal(mentions[0].isSelf, true);
 });
 
 test("mention 缺 ID → name 兜底命中", () => {
