@@ -275,15 +275,12 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		const sessionId = (ctx as { sessionManager?: { getSessionId(): string } })?.sessionManager?.getSessionId() ?? "";
 		const ev = event as { toolName?: string; args?: unknown };
 		const toolName = ev.toolName ?? "tool";
-		// 探针：确认事件是否携带命令参数（决定进度消息能否渲染 bash 代码块）
-		log.debug("feishu.bridge.tool_start", { toolName, hasArgs: ev.args !== undefined, keys: ev.args ? Object.keys(ev.args as object).slice(0, 8) : [] });
-		convManager?.onToolEvent(sessionId, toolName, "start");
+		convManager?.onToolEvent(sessionId, toolName, "start", (ev.args ?? {}) as Record<string, unknown>);
 	});
 	pi.on("tool_execution_end", (event, ctx) => {
 		const sessionId = (ctx as { sessionManager?: { getSessionId(): string } })?.sessionManager?.getSessionId() ?? "";
 		const toolName = (event as { toolName?: string })?.toolName ?? "tool";
-		const isError = Boolean((event as { isError?: boolean })?.isError);
-		convManager?.onToolEvent(sessionId, toolName, "end", isError);
+		convManager?.onToolEvent(sessionId, toolName, "end");
 	});
 
 	pi.on("session_start", async () => {

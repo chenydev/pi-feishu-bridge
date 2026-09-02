@@ -93,7 +93,7 @@ export class ConversationManager {
 	/** 最近一次注入的引用块（发送前清洗模型复述用）。 */
 	private lastQuoteBlock = "";
 	/** 进度消息状态（方案 A）：progressMessageId + 节流时间。 */
-	private readonly progressBySession = new Map<string, { messageId?: string; lastUpdateAt: number; toolStack: string[] }>();
+	private readonly progressBySession = new Map<string, { messageId?: string; lastUpdateAt: number; toolStack: string[]; lastCmd?: string }>();
 	private readonly progressMinIntervalMs = 1500;
 	private readonly progressMaxLines = 4;
 	private readonly pendingFile: string;
@@ -107,13 +107,19 @@ export class ConversationManager {
 	}
 
 	/** 工具事件 → 进度消息更新（pi.on("tool_execution_start/end") 转接）。 */
-	onToolEvent(sessionId: string, toolName: string, kind: "start" | "end", isError?: boolean): void {
+	onToolEvent(sessionId: string, toolName: string, kind: "start" | "end", args?: Record<string, unknown>): void {
 		const sess = [...this.sessions.values()].find((s) => s.sessionId === sessionId);
 		if (!sess) return;
 		// 用 conversationKey 索引（sessionId 在 createSession 前为 undefined，不可作 key）
 		const st = this.progressBySession.get(sess.conversationKey) ?? { lastUpdateAt: 0, toolStack: [] };
-		if (kind === "start") st.toolStack.push(toolName);
-		else {
+		if (kind === "start") {
+			st.toolStack.push(toolName);
+			if (toolName === "bash" || toolName === "terminal") {
+				// 记录最近一条命令（bash 代码块渲染，hermes supports_code_blocks 精神）
+				const cmd = args?.command ?? args?.cmd;
+				if (typeof cmd === "string" && cmd.trim()) st.lastCmd = cmd.trim();
+			}
+		} else {
 			const i = st.toolStack.lastIndexOf(toolName);
 			if (i >= 0) st.toolStack.splice(i, 1);
 		}
@@ -417,7 +423,7 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 	}
 
 	/** 撤回进度消息（方案 A：正式回复前撤回，避免刷屏）。 */
-	private async finishProgress(sess: BridgeSession, st: { messageId?: string; lastUpdateAt: number; toolStack: string[] }): Promise<void> {
+	private async finishProgress(sess: BridgeSession, st: { messageId?: string; lastUpdateAt: number; toolStack: string[]; lastCmd?: string }): Promise<void> {
 		if (!this.deps.recallMessage) return;
 		if (st.messageId) {
 			await this.deps.recallMessage(st.messageId);
