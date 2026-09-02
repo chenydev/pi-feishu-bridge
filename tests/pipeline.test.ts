@@ -131,7 +131,7 @@ test("全链路：重复 message_id 只 dispatch 一次", async () => {
 test("全链路：群批量合并后再 dispatch", async () => {
 	const dispatched: FeishuInboundMessage[] = [];
 	const pipeline = new InboundPipeline({
-		config: cfg({ groupPolicy: "open", batch: { enabled: true, textWindowMs: 30 } }),
+		config: cfg({ groupPolicy: "open", requireMention: false, batch: { enabled: true, textWindowMs: 30 } }),
 		transport: {} as FeishuTransport,
 		lastSent: new LastSentCache(8),
 		onDispatch: async (m) => { dispatched.push(m); },
