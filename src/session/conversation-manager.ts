@@ -294,6 +294,7 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 					conversationKey: sess.conversationKey,
 					sessionFile: sess.sessionFile,
 				});
+				sess.sessionId = sess.agent.sessionId;
 			}
 
 			// 流式/完成事件：从 subscribe 事件提取回复文本（pi SDK 的 prompt() 返回值
