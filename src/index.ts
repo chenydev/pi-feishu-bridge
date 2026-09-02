@@ -273,7 +273,10 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 	// （daemon-host 架构下主进程可收到子进程 agent 的工具事件，pi-feishu-link 同款用法）
 	pi.on("tool_execution_start", (event, ctx) => {
 		const sessionId = (ctx as { sessionManager?: { getSessionId(): string } })?.sessionManager?.getSessionId() ?? "";
-		const toolName = (event as { toolName?: string })?.toolName ?? "tool";
+		const ev = event as { toolName?: string; args?: unknown };
+		const toolName = ev.toolName ?? "tool";
+		// 探针：确认事件是否携带命令参数（决定进度消息能否渲染 bash 代码块）
+		log.debug("feishu.bridge.tool_start", { toolName, hasArgs: ev.args !== undefined, keys: ev.args ? Object.keys(ev.args as object).slice(0, 8) : [] });
 		convManager?.onToolEvent(sessionId, toolName, "start");
 	});
 	pi.on("tool_execution_end", (event, ctx) => {
