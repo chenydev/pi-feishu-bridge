@@ -148,11 +148,12 @@ function extractBodyText(body: Record<string, unknown>): string {
 // ------------------------------------------------------------ 提及 ----
 
 /** 提取 mention 引用（兼容 lark SDK 的 mentions[].id / mentions[].name 结构）。 */
-export function extractMentionIds(mention: unknown): { open_id?: string; user_id?: string; union_id?: string; name?: string } {
+export function extractMentionIds(mention: unknown): { key?: string; open_id?: string; user_id?: string; union_id?: string; name?: string } {
 	if (!mention || typeof mention !== "object") return {};
 	const m = mention as Record<string, unknown>;
 	const id = (m.id && typeof m.id === "object" ? (m.id as Record<string, unknown>) : {}) as Record<string, string>;
 	return {
+		key: typeof m.key === "string" ? m.key : undefined,
 		open_id: typeof id.open_id === "string" ? id.open_id : undefined,
 		user_id: typeof id.user_id === "string" ? id.user_id : undefined,
 		union_id: typeof id.union_id === "string" ? id.union_id : undefined,
@@ -178,7 +179,7 @@ export function buildMentionsMap(mentions: unknown[] | undefined, bot: BotIdenti
 		} else if (m.name && bot.name) {
 			isSelf = m.name === bot.name;
 		}
-		refs.push({ id: { open_id: m.open_id, user_id: m.user_id, union_id: m.union_id }, name: m.name, isSelf });
+		refs.push({ key: m.key, id: { open_id: m.open_id, user_id: m.user_id, union_id: m.union_id }, name: m.name, isSelf });
 	}
 	return refs;
 }

@@ -117,8 +117,8 @@ test("unknown 类型不崩", () => {
 	assert.equal(msg.msgType, "unknown");
 });
 
-test("mention 占位符 → 真实名（hermes _render_post_element 对齐）", () => {
-	const bot: BotIdentity = { openId: "ou_bot", userId: "", name: "飞书 CLI" };
+test("mention 占位符 → 真实名（hermes _render_post_element 对齐）", async () => {
+	const bot = { openId: "ou_bot", userId: "", name: "飞书 CLI" };
 	// 文本消息：@_user_2 替换为真实名
 	const msg = normalizeFeishuMessage({
 		messageId: "m1", chatId: "oc_g", chatType: "group",
@@ -130,7 +130,7 @@ test("mention 占位符 → 真实名（hermes _render_post_element 对齐）", 
 		sender: { sender_id: { open_id: "ou_li" }, sender_name: "李四" },
 		bot,
 	});
-	assert.equal(msg.text, "帮我看看"); // 自身 mention 剥离后（stripEdgeSelfMentions）
+	assert.equal(msg.text, "@张三 帮我看看"); // @_user_2 → 真实名（非自身，保留）
 	// 直接测 resolveMentionPlaceholders
 	const { resolveMentionPlaceholders } = await import("../src/inbound/normalize.js");
 	assert.equal(
