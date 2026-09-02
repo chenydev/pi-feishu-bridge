@@ -349,10 +349,25 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 				}
 			};
 			sess.agent.subscribe((ev) => {
-				this.deps.log?.("debug", "feishu.conv.event", {
-					chatId: sess.chatId,
-					type: (ev as { type?: string })?.type ?? "?",
-				});
+				// message_update 风暴降噪：只打非 text_delta 的 update（tool 事件等）
+				const evType = (ev as { type?: string })?.type ?? "?";
+				if (evType === "message_update") {
+					const ame = (ev as { assistantMessageEvent?: { type?: string } })?.assistantMessageEvent;
+					if (ame?.type === "text_delta") {
+						// 静默：纯流式文本
+					} else {
+						this.deps.log?.("debug", "feishu.conv.event", {
+							chatId: sess.chatId,
+							type: evType,
+							sub: ame?.type ?? (ev as { delta?: unknown }).delta !== undefined ? "delta" : "other",
+						});
+					}
+				} else {
+					this.deps.log?.("debug", "feishu.conv.event", {
+						chatId: sess.chatId,
+						type: evType,
+					});
+				}
 				const e = ev as {
 					type?: string;
 					delta?: string;

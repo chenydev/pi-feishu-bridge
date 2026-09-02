@@ -241,12 +241,12 @@ export class FeishuTransport {
 		return this.client.request({ ...opts, method: opts.method });
 	}
 
-	/** 进度消息：编辑已发消息内容（飞书 im.v1.message.update，仅 text/post）。 */
+	/** 进度消息：编辑已发消息内容（飞书 im.v1.message.update 是 PUT——PATCH 会 400）。 */
 	async editMessage(messageId: string, text: string): Promise<boolean> {
 		try {
 			await this.client?.request({
 				url: `/open-apis/im/v1/messages/${messageId}`,
-				method: "PATCH",
+				method: "PUT",
 				data: { content: JSON.stringify({ text }), msg_type: "text" },
 			});
 			return true;
