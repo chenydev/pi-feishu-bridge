@@ -110,13 +110,14 @@ export class ConversationManager {
 	onToolEvent(sessionId: string, toolName: string, kind: "start" | "end", isError?: boolean): void {
 		const sess = [...this.sessions.values()].find((s) => s.sessionId === sessionId);
 		if (!sess) return;
-		const st = this.progressBySession.get(sessionId) ?? { lastUpdateAt: 0, toolStack: [] };
+		// 用 conversationKey 索引（sessionId 在 createSession 前为 undefined，不可作 key）
+		const st = this.progressBySession.get(sess.conversationKey) ?? { lastUpdateAt: 0, toolStack: [] };
 		if (kind === "start") st.toolStack.push(toolName);
 		else {
 			const i = st.toolStack.lastIndexOf(toolName);
 			if (i >= 0) st.toolStack.splice(i, 1);
 		}
-		this.progressBySession.set(sessionId, st);
+		this.progressBySession.set(sess.conversationKey, st);
 		void this.renderProgress(sess, st);
 	}
 
@@ -279,9 +280,8 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 
 	private async runOne(sess: BridgeSession, item: QueuedMessage): Promise<void> {
 		this.markPending(item);
-		const sid = sess.sessionId ?? "unknown";
-		const st = this.progressBySession.get(sid) ?? { lastUpdateAt: 0, toolStack: [] };
-		this.progressBySession.set(sid, st);
+		const st = this.progressBySession.get(sess.conversationKey) ?? { lastUpdateAt: 0, toolStack: [] };
+		this.progressBySession.set(sess.conversationKey, st);
 		// 方案 A：处理中进度消息（完成后撤回）
 		if (this.deps.sender) {
 			const sent = await this.deps.sender.send(item.chatId, "🤖 正在处理…", {});
@@ -423,7 +423,7 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 			await this.deps.recallMessage(st.messageId);
 			st.messageId = undefined;
 		}
-		this.progressBySession.delete(sess.sessionId ?? "unknown");
+		this.progressBySession.delete(sess.conversationKey);
 	}
 
 	private async removeProcessingReaction(sess: BridgeSession, item: QueuedMessage): Promise<void> {
