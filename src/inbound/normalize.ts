@@ -51,7 +51,9 @@ function wrapInline(text: string, style: string[] | undefined): string {
 export function renderTextElement(el: PostElement): string {
 	if (!el.text) return "";
 	if (el.tag === "a" && el.href) return `[${el.text}](${el.href})`;
-	if (el.tag === "at" && el.user_id) return `@_user_${el.user_id}`;
+	// 飞书 post <at>.user_id 的值就是占位符本身（"@_user_N" / "@_all"），
+	// 不再拼前缀，由 resolveMentionPlaceholders 统一替换为真实名（hermes 对齐）。
+	if (el.tag === "at" && el.user_id) return el.user_id;
 	return wrapInline(el.text, el.style);
 }
 
@@ -189,6 +191,28 @@ export function mentionsBot(rawContent: string, mentions: FeishuMentionRef[]): b
 	return mentions.some((m) => m.isSelf);
 }
 
+const MENTION_PLACEHOLDER_RE = /@_user_\d+/g;
+
+/**
+ * 把 @_user_N 占位符替换为真实显示名（hermes _render_post_element 对齐）：
+ * mentions 里每个 mention 自带 key（占位符）+ name（真实名），查表替换；
+ * @_all → @all；查不到 → @user。
+ */
+export function resolveMentionPlaceholders(text: string, mentions: FeishuMentionRef[]): string {
+	if (!text || !MENTION_PLACEHOLDER_RE.test(text)) return text;
+	MENTION_PLACEHOLDER_RE.lastIndex = 0;
+	const byKey = new Map<string, FeishuMentionRef>();
+	for (const m of mentions) {
+		if (m.key) byKey.set(m.key, m);
+		if (m.name) byKey.set(m.name, m); // 兼容无 key 的 mention：名字也能对上
+	}
+	return text.replace(MENTION_PLACEHOLDER_RE, (placeholder) => {
+		const ref = byKey.get(placeholder);
+		if (!ref) return "@user";
+		return `@${ref.name || ref.id?.open_id || "user"}`;
+	}).replace(/@_all/g, "@all");
+}
+
 /** 剥离开头的自身 mention 占位（@_user_xxx）与 @name 前缀。 */
 export function stripEdgeSelfMentions(text: string, mentions: FeishuMentionRef[]): string {
 	let out = text;
@@ -282,8 +306,8 @@ export function normalizeFeishuMessage(input: NormalizeInput): FeishuInboundMess
 	}
 
 	const mentions = buildMentionsMap(input.mentions, input.bot);
-	// 用户反馈：注入 mention 前缀（（@飞书 CLI））显得奇怪；只剥离 @ 占位，不注入前缀。
-	const finalText = stripEdgeSelfMentions(text, mentions);
+	// @_user_N 占位符 → 真实名（hermes 对齐）；再剥离自身 @ 前缀（不注入提示前缀）。
+	const finalText = stripEdgeSelfMentions(resolveMentionPlaceholders(text, mentions), mentions);
 
 	const sender = (input.sender ?? {}) as Record<string, unknown>;
 	const senderIdObj = (sender.sender_id ?? {}) as Record<string, string>;

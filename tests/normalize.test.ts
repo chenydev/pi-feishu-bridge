@@ -116,3 +116,33 @@ test("unknown 类型不崩", () => {
 	const msg = normalizeFeishuMessage(base({ messageType: "系统", content: "" }));
 	assert.equal(msg.msgType, "unknown");
 });
+
+test("mention 占位符 → 真实名（hermes _render_post_element 对齐）", () => {
+	const bot: BotIdentity = { openId: "ou_bot", userId: "", name: "飞书 CLI" };
+	// 文本消息：@_user_2 替换为真实名
+	const msg = normalizeFeishuMessage({
+		messageId: "m1", chatId: "oc_g", chatType: "group",
+		messageType: "text", content: JSON.stringify({ text: "@_user_2 帮我看看" }),
+		mentions: [
+			{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "飞书 CLI" },
+			{ key: "@_user_2", id: { open_id: "ou_zhang" }, name: "张三" },
+		],
+		sender: { sender_id: { open_id: "ou_li" }, sender_name: "李四" },
+		bot,
+	});
+	assert.equal(msg.text, "帮我看看"); // 自身 mention 剥离后（stripEdgeSelfMentions）
+	// 直接测 resolveMentionPlaceholders
+	const { resolveMentionPlaceholders } = await import("../src/inbound/normalize.js");
+	assert.equal(
+		resolveMentionPlaceholders("给 @_user_2 说 @_user_3 好", [
+			{ key: "@_user_2", id: { open_id: "ou_zhang" }, name: "张三", isSelf: false },
+			{ key: "@_user_3", id: { open_id: "ou_wang" }, name: "王五", isSelf: false },
+		]),
+		"给 @张三 说 @王五 好",
+	);
+	// 查不到 → @user；@_all → @all
+	assert.equal(resolveMentionPlaceholders("@_user_9 @_all", []), "@user @all");
+	// post 渲染：<at> 直接输出占位符再由 resolver 替换（不再拼 @_user_ 前缀）
+	const { renderTextElement } = await import("../src/inbound/normalize.js");
+	assert.equal(renderTextElement({ tag: "at", user_id: "@_user_2" }), "@_user_2");
+});
