@@ -93,7 +93,7 @@ export class ConversationManager {
 	/** 最近一次注入的引用块（发送前清洗模型复述用）。 */
 	private lastQuoteBlock = "";
 	/** 进度消息状态（方案 A）：progressMessageId + 节流时间。 */
-	private readonly progressBySession = new Map<string, { messageId?: string; lastUpdateAt: number; toolStack: string[]; lastCmd?: string }>();
+	private readonly progressBySession = new Map<string, { messageId?: string; lastUpdateAt: number; toolStack: string[]; lastCmd?: string; startedAt?: number }>();
 	private readonly progressMinIntervalMs = 1500;
 	private readonly progressMaxLines = 4;
 	private readonly pendingFile: string;
@@ -288,10 +288,17 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		this.markPending(item);
 		const st = this.progressBySession.get(sess.conversationKey) ?? { lastUpdateAt: 0, toolStack: [] };
 		this.progressBySession.set(sess.conversationKey, st);
-		// 方案 A：处理中进度消息（完成后撤回）
+		let progressTimer: ReturnType<typeof setInterval> | undefined;
+		// 方案 A：处理中进度消息（回复挂载用户消息；完成后撤回）
 		if (this.deps.sender) {
-			const sent = await this.deps.sender.send(item.chatId, "🤖 正在处理…", {});
-			if (sent.success && sent.messageId) st.messageId = sent.messageId;
+			const sent = await this.deps.sender.send(item.chatId, "🤖 正在处理…", {
+				replyTo: item.messageId,
+				threadId: sess.threadId ?? item.threadId,
+			});
+			if (sent.success && sent.messageId) {
+				st.messageId = sent.messageId;
+				st.startedAt = Date.now();
+			}
 		}
 		try {
 			if (!sess.agent) {
@@ -360,9 +367,11 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 						streamedText += e.delta;
 					}
 				} else if (e.type === "message_end") {
-					// 关键：user 消息也会触发 message_end（role=user），必须先到会抢占
-					// sentFromEvent 导致 assistant 完整回复被跳过（对齐 pi-feishu-link
-					// handleMessageEnd 的 role==='assistant' 检查）
+					// 关键：user 消息也会触发 message_end（role=user），须先检查 role
+					// （对齐 pi-feishu-link handleMessageEnd 的 role==='assistant' 检查）。
+					// 多轮 agent：工具轮（stopReason=toolUse）也会 message_end——
+					// 只记最后一轮文本，prompt() resolve（= agent 全部结束）后统一发送，
+					// 避免中间轮文本（如"好的，再展开一层…"）被当最终回复发出。
 					if (e.message?.role !== "assistant") return;
 					const text = extractText(e.message?.content ?? e.content);
 					this.deps.log?.("debug", "feishu.conv.message_end_extract", {
@@ -371,13 +380,20 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 						hasMessage: Boolean(e.message),
 						hasContent: Boolean(e.content),
 					});
-					if (text) void sendReply(text);
+					if (text) lastEndText = text;
+					streamedText = ""; // 新一轮从零累积
 				}
 			});
 
 			// 组装提示词（回复链路可见性：B1）——对齐 hermes 的回复注入格式：
 			// `[Replying to: "原文"]` 方括号元信息（非对话内容，模型不易复述）；
 			// 区分回复自己消息 vs 回复他人消息；原文截断 500、占位转 @。
+			let lastEndText = "";
+			// 周期刷新进度消息（增量更新：长时间处理时持续展示耗时与工具状态）
+			progressTimer = setInterval(() => {
+				void this.renderProgress(sess, st);
+			}, 8000);
+
 			let prompt = item.text;
 			if (item.replyToMessageId && item.replyToText) {
 				const quote = item.replyToText.slice(0, 500).replace(/@_user_\w+/g, "@").replace(/\n/g, " ");
@@ -396,20 +412,21 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 			const result = await Promise.race([sess.agent.prompt(prompt), timeout]);
 			if (timeoutTimer) clearTimeout(timeoutTimer);
 
-			// 兜底：事件通道未送出则用累积流式文本/返回值
-			if (!sentFromEvent) {
-				const text = streamedText.trim() || extractAssistantText(result);
-				this.deps.log?.("debug", "feishu.conv.fallback_send", {
-					chatId: sess.chatId,
-					streamedLen: streamedText.length,
-					fallbackLen: text?.length ?? 0,
-				});
-				if (text) await sendReply(text);
-			}
+			// 最终发送：最后一轮 message_end 文本优先，其次流式累积/返回值
+			const text = lastEndText || streamedText.trim() || extractAssistantText(result);
+			this.deps.log?.("debug", "feishu.conv.final_send", {
+				chatId: sess.chatId,
+				lastEndLen: lastEndText.length,
+				streamedLen: streamedText.length,
+				textLen: text?.length ?? 0,
+			});
+			if (text) await sendReply(text);
+			clearInterval(progressTimer);
 			await this.removeProcessingReaction(sess, item);
 			await this.finishProgress(sess, st);
 			this.clearPending(item);
 		} catch (err) {
+			if (progressTimer) clearInterval(progressTimer);
 			await this.finishProgress(sess, st);
 			this.clearPending(item);
 			const msg = err instanceof Error ? err.message : String(err);
