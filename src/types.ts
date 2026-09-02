@@ -92,6 +92,8 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 export type InboundMsgType = "text" | "image" | "video" | "audio" | "file" | "post" | "merge_forward" | "share_chat" | "interactive" | "unknown";
 
 export interface FeishuMentionRef {
+	/** 占位符 key（@_user_N / @_all） */
+	key?: string;
 	id?: { open_id?: string; user_id?: string; union_id?: string };
 	name?: string;
 	isSelf: boolean;
