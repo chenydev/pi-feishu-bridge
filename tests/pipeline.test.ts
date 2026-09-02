@@ -246,3 +246,42 @@ test("会话隔离：群内按用户隔离 + 话题内共享（hermes 模型）"
 	// A/B 话题消息共享同一会话文件
 	assert.equal(sessionFiles[2], sessionFiles[3] ?? sessionFiles[2]);
 });
+
+test("进度消息：发送→工具事件更新→完成撤回（方案 A）", async () => {
+	const { ConversationManager } = await import("../src/session/conversation-manager.js");
+	const sent: string[] = [];
+	const edited: string[] = [];
+	const recalled: string[] = [];
+	const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+	const mgr = new ConversationManager({
+		config: cfg({ groupPolicy: "open" }),
+		sessionDir: "/tmp/feishu-test-progress",
+		sessionBackend: {
+			async createSession(opts: { sessionFile?: string }) {
+				return {
+					sessionId: "sid1",
+					async prompt() { await sleep(3000); return "final-reply"; },
+					subscribe: () => () => {},
+					modelId: "m",
+				};
+			},
+		},
+		sender: {
+			async send(_chat: string, text: string) { sent.push(text); return { success: true, messageId: `om_prog_${sent.length}` }; },
+		},
+		editMessage: async (_id: string, text: string) => { edited.push(text); return true; },
+		recallMessage: async (id: string) => { recalled.push(id); return true; },
+	} as never);
+	await mgr.route({ messageId: "m1", chatId: "oc_g", chatType: "group", senderId: "u", isBot: false, msgType: "text", text: "hi", mentions: [], ts: Date.now(), raw: undefined } as never);
+	await sleep(150);
+	// 处理中：工具事件 → 进度消息更新
+	mgr.onToolEvent("sid1", "bash", "start");
+	await sleep(1700); // 节流 1.5s
+	mgr.onToolEvent("sid1", "bash", "end");
+	assert.ok(edited.length >= 1, "工具事件应触发进度消息编辑");
+	assert.match(edited[0], /🔧/);
+	await sleep(1800); // prompt resolve → sendReply → 撤回进度消息
+	assert.equal(sent[0], "🤖 正在处理…");
+	assert.ok(recalled.length >= 1, "完成后应撤回进度消息");
+	assert.match(sent.join(" "), /final-reply/);
+});
