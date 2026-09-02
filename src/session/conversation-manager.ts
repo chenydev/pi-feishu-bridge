@@ -7,6 +7,17 @@ import { dirname, join } from "node:path";
 import type { BridgeConfig, FeishuInboundMessage, SessionBackend } from "../types.js";
 import type { Sender } from "../outbound/sender.js";
 
+/** 工具友好名（hermes build_status_phrase / pi-feishu toolDisplayName 风格）。 */
+function toolLabel(tool: string): string {
+	const map: Record<string, string> = {
+		read: "读取文件", write: "写入文件", edit: "编辑文件", bash: "执行命令", terminal: "执行命令",
+		grep: "搜索内容", find: "查找文件", fetch_content: "抓取网页", web_search: "搜索网页",
+		browser: "浏览网页", subagent_spawn: "启动子代理", memory_search: "搜索记忆",
+		"mcp": "调用 MCP", "plan_mode_question": "确认方案", "ask_user_question": "向你提问",
+	};
+	return map[tool] ?? tool;
+}
+
 /** pending 中断恢复文件（hermes resume_pending 简化版）：agent 运行中进程被杀，
  * 重启后据此重发未完成消息。 */
 interface PendingEntry {
@@ -32,6 +43,9 @@ export interface ConversationManagerDeps {
 		add(messageId: string, emoji: string): Promise<string | undefined>;
 		remove(messageId: string, reactionId: string): Promise<boolean>;
 	};
+	/** 进度消息编辑/撤回（方案 A：处理中消息实时更新工具进度）。 */
+	editMessage?: (messageId: string, text: string) => Promise<boolean>;
+	recallMessage?: (messageId: string) => Promise<boolean>;
 	/** agent 回复文本的发送器（默认 sender.send 到 chat，回复挂 bot 上一条消息）。 */
 	log?: (level: "debug" | "info" | "warn" | "error", msg: string, meta?: unknown) => void;
 	/** 超时（默认 300s）后通知用户并释放。 */
@@ -48,6 +62,8 @@ interface BridgeSession {
 	/** 话题 id（话题会话的发送目标 threadId）。 */
 	threadId?: string;
 	agent?: Awaited<ReturnType<SessionBackend["createSession"]>>;
+	/** agent 运行时 sessionId（tool 事件映射用，pi.on ctx.sessionManager.getSessionId()）。 */
+	sessionId?: string;
 	sessionFile: string;
 	queue: Array<QueuedMessage>;
 	activeRun: boolean;
@@ -76,6 +92,10 @@ export class ConversationManager {
 	private now: () => number;
 	/** 最近一次注入的引用块（发送前清洗模型复述用）。 */
 	private lastQuoteBlock = "";
+	/** 进度消息状态（方案 A）：progressMessageId + 节流时间。 */
+	private readonly progressBySession = new Map<string, { messageId?: string; lastUpdateAt: number; toolStack: string[] }>();
+	private readonly progressMinIntervalMs = 1500;
+	private readonly progressMaxLines = 4;
 	private readonly pendingFile: string;
 	private readonly pendingEnabled: boolean;
 
@@ -84,6 +104,32 @@ export class ConversationManager {
 		this.now = deps.now ?? Date.now;
 		this.pendingFile = deps.pendingFile ?? "";
 		this.pendingEnabled = Boolean(deps.pendingFile);
+	}
+
+	/** 工具事件 → 进度消息更新（pi.on("tool_execution_start/end") 转接）。 */
+	onToolEvent(sessionId: string, toolName: string, kind: "start" | "end", isError?: boolean): void {
+		const sess = [...this.sessions.values()].find((s) => s.sessionId === sessionId);
+		if (!sess) return;
+		const st = this.progressBySession.get(sessionId) ?? { lastUpdateAt: 0, toolStack: [] };
+		if (kind === "start") st.toolStack.push(toolName);
+		else {
+			const i = st.toolStack.lastIndexOf(toolName);
+			if (i >= 0) st.toolStack.splice(i, 1);
+		}
+		this.progressBySession.set(sessionId, st);
+		void this.renderProgress(sess, st);
+	}
+
+	private async renderProgress(sess: BridgeSession, st: { messageId?: string; lastUpdateAt: number; toolStack: string[] }): Promise<void> {
+		if (!this.deps.editMessage) return;
+		const now = Date.now();
+		if (now - st.lastUpdateAt < this.progressMinIntervalMs) return; // 节流
+		st.lastUpdateAt = now;
+		if (!st.messageId) return; // 进度消息还没发（或已撤回）
+		const lines = st.toolStack.slice(-this.progressMaxLines).map((t) => `🔧 ${toolLabel(t)}`);
+		const text = lines.length ? `🤖 正在处理…
+${lines.join("\n")}` : "🤖 正在处理…";
+		await this.deps.editMessage(st.messageId, text);
 	}
 
 	/** 启动时恢复上次中断的未完成消息（hermes resume_pending）。 */
@@ -233,6 +279,14 @@ export class ConversationManager {
 
 	private async runOne(sess: BridgeSession, item: QueuedMessage): Promise<void> {
 		this.markPending(item);
+		const sid = sess.sessionId ?? "unknown";
+		const st = this.progressBySession.get(sid) ?? { lastUpdateAt: 0, toolStack: [] };
+		this.progressBySession.set(sid, st);
+		// 方案 A：处理中进度消息（完成后撤回）
+		if (this.deps.sender) {
+			const sent = await this.deps.sender.send(item.chatId, "🤖 正在处理…", {});
+			if (sent.success && sent.messageId) st.messageId = sent.messageId;
+		}
 		try {
 			if (!sess.agent) {
 				sess.agent = await this.deps.sessionBackend.createSession({
@@ -346,8 +400,10 @@ export class ConversationManager {
 				if (text) await sendReply(text);
 			}
 			await this.removeProcessingReaction(sess, item);
+			await this.finishProgress(sess, st);
 			this.clearPending(item);
 		} catch (err) {
+			await this.finishProgress(sess, st);
 			this.clearPending(item);
 			const msg = err instanceof Error ? err.message : String(err);
 			if (msg === "run timeout") {
@@ -357,6 +413,16 @@ export class ConversationManager {
 				await this.notify(sess.chatId, `处理出错：${msg.slice(0, 200)}`);
 			}
 		}
+	}
+
+	/** 撤回进度消息（方案 A：正式回复前撤回，避免刷屏）。 */
+	private async finishProgress(sess: BridgeSession, st: { messageId?: string; lastUpdateAt: number; toolStack: string[] }): Promise<void> {
+		if (!this.deps.recallMessage) return;
+		if (st.messageId) {
+			await this.deps.recallMessage(st.messageId);
+			st.messageId = undefined;
+		}
+		this.progressBySession.delete(sess.sessionId ?? "unknown");
 	}
 
 	private async removeProcessingReaction(sess: BridgeSession, item: QueuedMessage): Promise<void> {

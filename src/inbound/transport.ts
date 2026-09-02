@@ -241,6 +241,41 @@ export class FeishuTransport {
 		return this.client.request({ ...opts, method: opts.method });
 	}
 
+	/** 进度消息：编辑已发消息内容（飞书 im.v1.message.update，仅 text/post）。 */
+	async editMessage(messageId: string, text: string): Promise<boolean> {
+		try {
+			await this.client?.request({
+				url: `/open-apis/im/v1/messages/${messageId}`,
+				method: "PATCH",
+				data: { content: JSON.stringify({ text }), msg_type: "text" },
+			});
+			return true;
+		} catch (err) {
+			this.deps.log?.("warn", "feishu.transport.edit_failed", {
+				messageId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	}
+
+	/** 进度消息：撤回消息（im.v1.message.recall）。 */
+	async recallMessage(messageId: string): Promise<boolean> {
+		try {
+			await this.client?.request({
+				url: `/open-apis/im/v1/messages/${messageId}`,
+				method: "DELETE",
+			});
+			return true;
+		} catch (err) {
+			this.deps.log?.("warn", "feishu.transport.recall_failed", {
+				messageId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	}
+
 	/** bot 身份水合：/open-apis/bot/v3/info（带 TTL 缓存，避免高频重启打爆接口）。 */
 	async hydrateBotIdentity(): Promise<BotIdentity> {
 		const ttl = this.deps.probeTtlMs ?? 60_000;

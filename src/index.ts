@@ -115,6 +115,8 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			sessionDir: paths.sessionDir,
 			sessionBackend: new PiSessionBackend({ sessionDir: paths.sessionDir, log: (l, m, x) => log[l](m, x) }),
 			sender,
+			editMessage: (messageId, text) => transport?.editMessage(messageId, text) ?? Promise.resolve(false),
+			recallMessage: (messageId) => transport?.recallMessage(messageId) ?? Promise.resolve(false),
 			lastSent,
 			reactions: {
 				add: (messageId, emoji) => transport!.addReaction(messageId, emoji),
@@ -266,6 +268,20 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 	});
 
 	// ------------------------------------------------------------ 生命周期 ----
+
+	// 工具执行进度（方案 A）：tool_execution_start/end → 进度消息更新
+	// （daemon-host 架构下主进程可收到子进程 agent 的工具事件，pi-feishu-link 同款用法）
+	pi.on("tool_execution_start", (event, ctx) => {
+		const sessionId = (ctx as { sessionManager?: { getSessionId(): string } })?.sessionManager?.getSessionId() ?? "";
+		const toolName = (event as { toolName?: string })?.toolName ?? "tool";
+		convManager?.onToolEvent(sessionId, toolName, "start");
+	});
+	pi.on("tool_execution_end", (event, ctx) => {
+		const sessionId = (ctx as { sessionManager?: { getSessionId(): string } })?.sessionManager?.getSessionId() ?? "";
+		const toolName = (event as { toolName?: string })?.toolName ?? "tool";
+		const isError = Boolean((event as { isError?: boolean })?.isError);
+		convManager?.onToolEvent(sessionId, toolName, "end", isError);
+	});
 
 	pi.on("session_start", async () => {
 		homeDir = process.env.FEISHU_BRIDGE_HOME ?? pi.getAgentDir();
