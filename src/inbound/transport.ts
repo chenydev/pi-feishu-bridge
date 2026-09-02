@@ -329,6 +329,16 @@ export class FeishuTransport {
 		const sender = (body.sender ?? msg.sender ?? {}) as Record<string, unknown>;
 		const senderIdObj = (sender.sender_id ?? {}) as Record<string, unknown>;
 
+		// 探针：确认 mentions 原始结构（key/name 是否存在）
+		if (Array.isArray(msg.mentions) && msg.mentions.length > 0) {
+			this.deps.log?.("debug", "feishu.transport.mentions_probe", {
+				count: msg.mentions.length,
+				keys: (msg.mentions as Record<string, unknown>[]).map((m) => ({ key: m.key, name: m.name, id: (m.id as Record<string, unknown>)?.open_id ?? null })),
+			});
+		} else {
+			this.deps.log?.("debug", "feishu.transport.mentions_probe", { count: 0, raw: msg.mentions === undefined ? "undefined" : "empty" });
+		}
+
 		// 组装 normalize 输入（保持与 normalize.ts 的纯函数约定）
 		const normalized = await this.normalizeInbound({
 			messageId,
