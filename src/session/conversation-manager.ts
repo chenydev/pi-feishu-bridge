@@ -139,6 +139,25 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		await this.deps.editMessage(st.messageId, text);
 	}
 
+	/** 优雅关闭：撤回所有进行中的进度消息与处理中表情（SIGTERM 调用）。 */
+	async shutdown(): Promise<void> {
+		const tasks: Promise<unknown>[] = [];
+		for (const [key, sess] of this.sessions) {
+			const st = this.progressBySession.get(key);
+			if (st?.messageId && this.deps.recallMessage) {
+				tasks.push(this.deps.recallMessage(st.messageId).catch(() => false));
+				st.messageId = undefined;
+			}
+			for (const item of sess.queue) {
+				if (item.emojiReactionId && this.deps.reactions) {
+					tasks.push(this.deps.reactions.remove(item.messageId, item.emojiReactionId).catch(() => false));
+				}
+			}
+		}
+		this.progressBySession.clear();
+		await Promise.allSettled(tasks);
+	}
+
 	/** 启动时恢复上次中断的未完成消息（hermes resume_pending）。 */
 	async recoverPending(): Promise<number> {
 		if (!this.pendingEnabled) return 0;

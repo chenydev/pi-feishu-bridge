@@ -3,7 +3,6 @@
  * 提供 /feishu 命令与连接 supervisor（指数退避重连）。
  * 设计依据：docs/DESIGN.md §2/§3.7。
  */
-import { join } from "node:path";
 import type { ExtensionAPI } from "./pi-types.js";
 import type { BridgeConfig, BridgeStatus, GroupPolicy } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
@@ -114,6 +113,7 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			config,
 			sessionDir: paths.sessionDir,
 			sessionBackend: new PiSessionBackend({ sessionDir: paths.sessionDir, log: (l, m, x) => log[l](m, x) }),
+			pendingFile: join(paths.sessionDir, "..", "pending.jsonl"),
 			sender,
 			editMessage: (messageId, text) => transport?.editMessage(messageId, text) ?? Promise.resolve(false),
 			recallMessage: (messageId) => transport?.recallMessage(messageId) ?? Promise.resolve(false),
@@ -294,6 +294,13 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		// 网关重启恢复：重发上次中断的未完成消息（hermes resume_pending）
 		const recovered = await convManager?.recoverPending() ?? 0;
 		if (recovered > 0) log.warn("bridge recovered pending messages", { count: recovered });
+	});
+
+	// 优雅关闭：docker stop/restart 时撤回进行中的进度消息与 Typing 表情，
+	// 避免残留"🤖 正在处理…"消息和敲键盘表情（kill -9 时由 recoverPending 兜底重发）。
+	process.on("SIGTERM", () => {
+		void convManager?.shutdown().finally(() => process.exit(0));
+		setTimeout(() => process.exit(0), 3000).unref();
 	});
 
 	pi.on("session_shutdown", async () => {
