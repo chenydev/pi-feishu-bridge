@@ -3,6 +3,7 @@
  * 提供 /feishu 命令与连接 supervisor（指数退避重连）。
  * 设计依据：docs/DESIGN.md §2/§3.7。
  */
+import { join } from "node:path";
 import type { ExtensionAPI } from "./pi-types.js";
 import type { BridgeConfig, BridgeStatus, GroupPolicy } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
