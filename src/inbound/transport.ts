@@ -7,11 +7,18 @@
  * - 事件负载可能被 SDK 包成 { event: {...} }，统一剥壳。
  */
 import type { BotIdentity, BridgeConfig, FeishuInboundMessage } from "../types.js";
+import type { ResourceRef } from "../types.js";
+import type { Readable } from "node:stream";
 
 // ---- 结构接口（真实 @larksuiteoapi/node-sdk 满足；测试注入 fake）----
 
 export interface LarkSdkClient {
 	request(opts: { url: string; method: string; params?: unknown; data?: unknown; headers?: Record<string, string> }): Promise<unknown>;
+	im?: { v1?: {
+		messageResource?: { get(payload: { params: { type: string }; path: { message_id: string; file_key: string } }): Promise<{ getReadableStream(): Readable; headers?: Record<string, unknown> }> };
+		image?: { create(payload: { data: { image_type: "message"; image: Buffer } }): Promise<unknown> };
+		file?: { create(payload: { data: { file_type: "stream" | "mp4" | "opus"; file_name: string; file: Buffer } }): Promise<unknown> };
+	} };
 }
 
 export interface LarkSdkDispatcher {
@@ -21,6 +28,7 @@ export interface LarkSdkDispatcher {
 export interface LarkSdkWsClient {
 	start(opts: { eventDispatcher: LarkSdkDispatcher }): void;
 	close(params?: { force?: boolean }): void;
+	getConnectionStatus?(): string | { state?: string };
 }
 
 export interface LarkSdkLike {
@@ -47,8 +55,17 @@ export interface TransportDeps {
 	sdk: LarkSdkLike;
 	onMessage: (msg: FeishuInboundMessage) => Promise<void>;
 	onStatus?: (connState: string, reconnectCount: number) => void;
+	onCardAction?: (action: CardAction) => Promise<unknown>;
 	log?: (level: "debug" | "info" | "warn" | "error", msg: string, meta?: unknown) => void;
 	probeTtlMs?: number; // 测试注入
+	now?: () => number;
+}
+
+export interface CardAction {
+	messageId: string;
+	chatId?: string;
+	operatorOpenId: string;
+	value?: Record<string, unknown>;
 }
 
 export interface BotProbeResult {
@@ -67,8 +84,17 @@ export class FeishuTransport {
 	private probeCache: { at: number; identity: BotIdentity } | undefined;
 	/** 最近一次 start() 的时间戳：上层 watchdog 据此宽限握手期，避免误判重连。 */
 	private connectStartedAt = 0;
+	private downSince: number | undefined;
+	private generation = 0;
+	/** 仅显式 start/stop 改变，用于使并发 reconnect 意图失效。 */
+	private lifecycleIntent = 0;
+	private startPromise: Promise<void> | undefined;
+	private reconnectPromise: Promise<void> | undefined;
+	private readonly now: () => number;
 
-	constructor(private deps: TransportDeps) {}
+	constructor(private deps: TransportDeps) {
+		this.now = deps.now ?? Date.now;
+	}
 
 	getBotIdentity(): BotIdentity {
 		return this.botIdentity;
@@ -78,7 +104,14 @@ export class FeishuTransport {
 		return this.connectStartedAt;
 	}
 
+	getDownSince(): number | undefined {
+		return this.downSince;
+	}
+
 	isConnected(): boolean {
+		const sdkStatus = this.wsClient?.getConnectionStatus?.();
+		const sdkState = typeof sdkStatus === "string" ? sdkStatus : sdkStatus?.state;
+		if (sdkState && sdkState !== "connected" && this.wsReady && this.running) this.markDisconnected(new Error(`ws state ${sdkState}`));
 		return this.wsReady;
 	}
 
@@ -88,19 +121,35 @@ export class FeishuTransport {
 
 	async start(): Promise<void> {
 		if (this.running) return;
+		if (this.startPromise) return this.startPromise;
+		this.lifecycleIntent += 1;
+		this.startPromise = this.doStart();
+		try {
+			await this.startPromise;
+		} finally {
+			this.startPromise = undefined;
+		}
+	}
+
+	private async doStart(): Promise<void> {
 		const { sdk, config } = this.deps;
+		const generation = ++this.generation;
+		this.running = true;
+		this.connectStartedAt = this.now();
 		const domain = config.domain === "lark" ? sdk.Domain.Lark : sdk.Domain.Feishu;
 		this.closeWs();
 		this.client = new sdk.Client({ appId: config.appId, appSecret: config.appSecret, appType: 0, domain });
 
 		// bot 身份水合（hermes 设计：不依赖 env/时序；失败不阻塞启动，降级为空）
 		this.botIdentity = await this.hydrateBotIdentity();
+		if (!this.running || generation !== this.generation) return;
 		if (!this.botIdentity.openId && config.botOpenId) this.botIdentity.openId = config.botOpenId;
 		if (!this.botIdentity.name && config.botName) this.botIdentity.name = config.botName;
 		this.deps.log?.("info", "feishu.transport.bot_identity", this.botIdentity);
 
 		const dispatcher = new sdk.EventDispatcher({}).register({
 			"im.message.receive_v1": async (data: unknown) => this.handleRawMessage(data),
+			"card.action.trigger": async (data: unknown) => this.handleCardAction(data),
 			"im.message.message_read_v1": async () => undefined,
 			"im.message.recalled_v1": async () => undefined,
 			"im.chat.member.bot.added_v1": async () => undefined,
@@ -115,33 +164,47 @@ export class FeishuTransport {
 			appSecret: config.appSecret,
 			autoReconnect: false,
 			onReady: () => {
+				if (!this.running || generation !== this.generation) return;
 				this.wsReady = true;
 				this.connectStartedAt = 0;
+				this.downSince = undefined;
 				this.reconnectCount = 0;
 				this.deps.onStatus?.("connected", this.reconnectCount);
 				this.deps.log?.("info", "feishu.transport.ws_ready");
 			},
 			onError: (err: unknown) => {
-				this.wsReady = false;
-				this.deps.onStatus?.("error", this.reconnectCount);
-				this.deps.log?.("error", "feishu.transport.ws_error", {
-					error: err instanceof Error ? err.message : String(err),
-				});
+				if (generation === this.generation) this.markDisconnected(err);
 			},
 		});
-		this.running = true;
-		this.connectStartedAt = Date.now();
 		try {
 			this.wsClient.start({ eventDispatcher: dispatcher });
 		} catch (err) {
+			this.markDisconnected(err);
 			this.running = false;
 			throw err;
 		}
 	}
 
+	private markDisconnected(error: unknown): void {
+		if (!this.running) return;
+		this.wsReady = false;
+		this.downSince ??= this.now();
+		this.deps.onStatus?.("error", this.reconnectCount);
+		this.deps.log?.("error", "feishu.transport.ws_error", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+
 	async stop(): Promise<void> {
+		this.lifecycleIntent += 1;
+		this.stopTransport();
+	}
+
+	private stopTransport(): void {
 		this.running = false;
 		this.wsReady = false;
+		this.connectStartedAt = 0;
+		this.generation += 1;
 		this.closeWs();
 	}
 
@@ -185,9 +248,131 @@ export class FeishuTransport {
 
 	/** 受控重连：transport 层不自动重连，由 supervisor 调用（指数退避在 supervisor）。 */
 	async reconnect(): Promise<void> {
-		this.reconnectCount += 1;
-		await this.stop();
-		await this.start();
+		if (this.reconnectPromise) return this.reconnectPromise;
+		this.reconnectPromise = (async () => {
+			const lifecycleIntent = this.lifecycleIntent;
+			this.reconnectCount += 1;
+			this.stopTransport();
+			// 给并发的显式 stop 一个失效本次重连意图的机会。
+			await Promise.resolve();
+			if (this.lifecycleIntent !== lifecycleIntent) return;
+			await this.start();
+		})();
+		try {
+			await this.reconnectPromise;
+		} finally {
+			this.reconnectPromise = undefined;
+		}
+	}
+
+	/** 获取单个 chat 的有界历史消息，供短时断线补收。 */
+	async listChatHistory(chatId: string, startTimeMs: number, endTimeMs: number, limit = 50): Promise<FeishuInboundMessage[]> {
+		const res = (await this.authedRequest({
+			url: "/open-apis/im/v1/messages",
+			method: "GET",
+			params: {
+				container_id_type: "chat_id",
+				container_id: chatId,
+				start_time: String(Math.floor(startTimeMs / 1000)),
+				end_time: String(Math.ceil(endTimeMs / 1000)),
+				sort_type: "ByCreateTimeAsc",
+				page_size: Math.max(1, Math.min(50, limit)),
+			},
+		})) as Record<string, unknown>;
+		const data = (res.data ?? res) as Record<string, unknown>;
+		const items = Array.isArray(data.items) ? data.items as Array<Record<string, unknown>> : [];
+		const output: FeishuInboundMessage[] = [];
+		for (const item of items.slice(0, limit)) {
+			const body = (item.body ?? {}) as Record<string, unknown>;
+			const sender = (item.sender ?? {}) as Record<string, unknown>;
+			const rawSenderId = sender.id ?? sender.sender_id ?? {};
+			const idType = typeof sender.id_type === "string" ? sender.id_type : "open_id";
+			const senderId = typeof rawSenderId === "string" ? { [idType]: rawSenderId } : rawSenderId as Record<string, unknown>;
+			const normalized = await this.normalizeInbound({
+				messageId: typeof item.message_id === "string" ? item.message_id : "",
+				chatId: typeof item.chat_id === "string" ? item.chat_id : chatId,
+				chatType: typeof item.chat_type === "string" ? item.chat_type : "group",
+				messageType: typeof item.msg_type === "string" ? item.msg_type : typeof item.message_type === "string" ? item.message_type : "text",
+				content: typeof body.content === "string" ? body.content : typeof item.content === "string" ? item.content : "",
+				sender: { sender_id: senderId, sender_type: sender.sender_type },
+				mentions: Array.isArray(item.mentions) ? item.mentions : undefined,
+				parentId: typeof item.parent_id === "string" ? item.parent_id : undefined,
+				rootId: typeof item.root_id === "string" ? item.root_id : undefined,
+				threadId: typeof item.thread_id === "string" ? item.thread_id : undefined,
+				bot: this.botIdentity,
+			});
+			if (normalized) output.push(normalized);
+		}
+		return output;
+	}
+
+	async downloadResource(ref: ResourceRef, maxBytes: number): Promise<{ buffer: Buffer; mimeType?: string }> {
+		const messageResource = this.client?.im?.v1?.messageResource;
+		if (!messageResource) throw new Error("messageResource.get unavailable");
+		const response = await messageResource.get({
+			params: { type: ref.kind === "image" ? "image" : "file" },
+			path: { message_id: ref.messageId, file_key: ref.key },
+		});
+		const headers = response.headers ?? {};
+		const declared = Number(headers["content-length"] ?? headers["Content-Length"] ?? 0);
+		if (Number.isFinite(declared) && declared > maxBytes) throw new Error(`resource too large: ${declared} > ${maxBytes}`);
+		const chunks: Buffer[] = [];
+		let total = 0;
+		for await (const chunk of response.getReadableStream()) {
+			const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+			total += buffer.length;
+			if (total > maxBytes) throw new Error(`resource too large: ${total} > ${maxBytes}`);
+			chunks.push(buffer);
+		}
+		const contentType = headers["content-type"] ?? headers["Content-Type"];
+		return { buffer: Buffer.concat(chunks), mimeType: typeof contentType === "string" ? contentType.split(";")[0]?.trim() : undefined };
+	}
+
+	async uploadImage(image: Buffer): Promise<string> {
+		const api = this.client?.im?.v1?.image;
+		if (!api) throw new Error("image.create unavailable");
+		const response = await api.create({ data: { image_type: "message", image } }) as { image_key?: string; data?: { image_key?: string } };
+		const key = response.data?.image_key ?? response.image_key;
+		if (!key) throw new Error("upload image failed: no image_key");
+		return key;
+	}
+
+	async uploadFile(fileName: string, file: Buffer, fileType: "stream" | "mp4" | "opus" = "stream"): Promise<string> {
+		const api = this.client?.im?.v1?.file;
+		if (!api) throw new Error("file.create unavailable");
+		const response = await api.create({ data: { file_type: fileType, file_name: fileName, file } }) as { file_key?: string; data?: { file_key?: string } };
+		const key = response.data?.file_key ?? response.file_key;
+		if (!key) throw new Error("upload file failed: no file_key");
+		return key;
+	}
+
+	async sendCard(chatId: string, card: unknown, opts: { replyTo?: string; threadId?: string } = {}): Promise<string | undefined> {
+		const response = await this.rawRequest(opts.replyTo ? {
+			url: `/open-apis/im/v1/messages/${opts.replyTo}/reply`, method: "POST",
+			data: { msg_type: "interactive", content: JSON.stringify(card), reply_in_thread: Boolean(opts.threadId) },
+		} : {
+			url: "/open-apis/im/v1/messages", method: "POST",
+			params: opts.threadId ? { receive_id_type: "thread_id" } : { receive_id_type: "chat_id" },
+			data: { receive_id: opts.threadId ?? chatId, msg_type: "interactive", content: JSON.stringify(card) },
+		}) as { data?: { message_id?: string } };
+		return response.data?.message_id;
+	}
+
+	private async handleCardAction(data: unknown): Promise<unknown> {
+		const outer = data as Record<string, unknown>;
+		const context = (outer.context ?? outer) as Record<string, unknown>;
+		const operator = (outer.operator ?? {}) as Record<string, unknown>;
+		const action = (outer.action ?? {}) as Record<string, unknown>;
+		const messageId = context.open_message_id ?? context.message_id ?? outer.open_message_id;
+		const operatorOpenId = operator.open_id;
+		if (typeof messageId !== "string" || typeof operatorOpenId !== "string") return undefined;
+		const rawChatId = context.open_chat_id ?? context.chat_id ?? outer.open_chat_id;
+		return this.deps.onCardAction?.({
+			messageId,
+			chatId: typeof rawChatId === "string" ? rawChatId : undefined,
+			operatorOpenId,
+			value: action.value && typeof action.value === "object" ? action.value as Record<string, unknown> : undefined,
+		});
 	}
 
 	// ------------------------------------------------------------ REST ----
@@ -323,7 +508,10 @@ export class FeishuTransport {
 		const msg = (body.message ?? body) as Record<string, unknown>;
 		const messageId = typeof msg.message_id === "string" ? msg.message_id : undefined;
 		if (!messageId) {
-			this.deps.log?.("debug", "feishu.transport.drop_malformed", { raw });
+			this.deps.log?.("debug", "feishu.transport.drop_malformed", {
+				rawType: Array.isArray(raw) ? "array" : typeof raw,
+				keys: raw && typeof raw === "object" ? Object.keys(raw as Record<string, unknown>).slice(0, 12) : [],
+			});
 			return;
 		}
 		const sender = (body.sender ?? msg.sender ?? {}) as Record<string, unknown>;
@@ -333,7 +521,11 @@ export class FeishuTransport {
 		if (Array.isArray(msg.mentions) && msg.mentions.length > 0) {
 			this.deps.log?.("debug", "feishu.transport.mentions_probe", {
 				count: msg.mentions.length,
-				keys: (msg.mentions as Record<string, unknown>[]).map((m) => ({ key: m.key, name: m.name, id: (m.id as Record<string, unknown>)?.open_id ?? null })),
+				shapes: (msg.mentions as Record<string, unknown>[]).map((m) => ({
+					hasKey: typeof m.key === "string",
+					hasName: typeof m.name === "string",
+					hasOpenId: typeof (m.id as Record<string, unknown> | undefined)?.open_id === "string",
+				})),
 			});
 		} else {
 			this.deps.log?.("debug", "feishu.transport.mentions_probe", { count: 0, raw: msg.mentions === undefined ? "undefined" : "empty" });

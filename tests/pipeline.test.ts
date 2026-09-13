@@ -13,6 +13,9 @@ function cfg(over: Partial<BridgeConfig> = {}): BridgeConfig {
 	return { ...DEFAULT_CONFIG, ...over };
 }
 
+const BATCH = { enabled: true, textWindowMs: 30, maxMessages: 8, maxChars: 4_000 };
+const NO_BATCH = { ...BATCH, enabled: false, textWindowMs: 3000 };
+
 test("DedupCache：重复拒绝", () => {
 	const d = new DedupCache(16);
 	assert.equal(d.check("m1"), true);
@@ -30,24 +33,24 @@ test("DedupCache：容量淘汰最旧", () => {
 	assert.equal(d.check("a"), true); // a 已被淘汰，重新接受
 });
 
-test("TextBatcher：窗口内合并 / 窗口外新开", () => {
+test("TextBatcher：窗口内合并 / 不同 key 新开", () => {
 	const b = new TextBatcher(1000);
 	const mk = (chat: string, text: string): FeishuInboundMessage =>
-		({ chatId: chat, chatType: "group", msgType: "text", text, messageId: Math.random().toString(), senderId: "u", isBot: false, mentions: [], ts: Date.now(), raw: undefined }) as FeishuInboundMessage;
-	assert.equal(b.offer(mk("oc_1", "a")), false);
-	assert.equal(b.offer(mk("oc_1", "b")), true);
-	assert.equal(b.offer(mk("oc_2", "x")), false);
-	const win1 = b.flush("oc_1");
+		({ chatId: chat, chatType: "group", msgType: "text", text, messageId: Math.random().toString(), senderId: "u", isBot: false, mentions: [], resources: [], ts: Date.now(), raw: undefined }) as FeishuInboundMessage;
+	assert.equal(b.offer("k1", mk("oc_1", "a")), false);
+	assert.equal(b.offer("k1", mk("oc_1", "b")), true);
+	assert.equal(b.offer("k2", mk("oc_2", "x")), false);
+	const win1 = b.flush("k1");
 	assert.ok(win1);
 	assert.deepEqual(win1.parts, ["a", "b"]);
-	const win2 = b.flush("oc_2");
+	const win2 = b.flush("k2");
 	assert.deepEqual(win2?.parts, ["x"]);
 });
 
 test("非 text 消息不进批处理", () => {
 	const b = new TextBatcher(1000);
 	const img = { chatId: "oc_1", chatType: "group", msgType: "image", text: "", messageId: "m", senderId: "u", mentions: [], ts: Date.now(), raw: undefined } as unknown as FeishuInboundMessage;
-	assert.equal(b.offer(img), false);
+	assert.equal(b.offer("k1", img), false);
 });
 
 // ------------------------------------------------------------ 全链路 ----
@@ -77,6 +80,7 @@ function fakeMsg(over: Partial<FeishuInboundMessage> = {}): FeishuInboundMessage
 		msgType: "text",
 		text: "hi",
 		mentions: [],
+		resources: [],
 		ts: Date.now(),
 		raw: undefined,
 		...over,
@@ -87,7 +91,7 @@ test("全链路：@ 消息 dispatch（含回复原文拉取）", async () => {
 	const dispatched: FeishuInboundMessage[] = [];
 	const transport = new FakeTransport() as unknown as FeishuTransport;
 	const pipeline = new InboundPipeline({
-		config: cfg({ groupPolicy: "mention", batch: { enabled: false, textWindowMs: 3000 } }),
+		config: cfg({ groupPolicy: "mention", batch: NO_BATCH }),
 		transport,
 		lastSent: new LastSentCache(8),
 		onDispatch: async (m) => { dispatched.push(m); },
@@ -103,7 +107,7 @@ test("全链路：@ 消息 dispatch（含回复原文拉取）", async () => {
 test("全链路：未 @ 群消息丢弃（mention 策略）", async () => {
 	const dispatched: FeishuInboundMessage[] = [];
 	const pipeline = new InboundPipeline({
-		config: cfg({ groupPolicy: "mention", batch: { enabled: false, textWindowMs: 3000 } }),
+		config: cfg({ groupPolicy: "mention", batch: NO_BATCH }),
 		transport: {} as FeishuTransport,
 		lastSent: new LastSentCache(8),
 		onDispatch: async (m) => { dispatched.push(m); },
@@ -116,7 +120,7 @@ test("全链路：未 @ 群消息丢弃（mention 策略）", async () => {
 test("全链路：重复 message_id 只 dispatch 一次", async () => {
 	const dispatched: FeishuInboundMessage[] = [];
 	const pipeline = new InboundPipeline({
-		config: cfg({ groupPolicy: "open", batch: { enabled: false, textWindowMs: 3000 } }),
+		config: cfg({ groupPolicy: "open", batch: NO_BATCH }),
 		transport: {} as FeishuTransport,
 		lastSent: new LastSentCache(8),
 		onDispatch: async (m) => { dispatched.push(m); },
@@ -131,7 +135,7 @@ test("全链路：重复 message_id 只 dispatch 一次", async () => {
 test("全链路：群批量合并后再 dispatch", async () => {
 	const dispatched: FeishuInboundMessage[] = [];
 	const pipeline = new InboundPipeline({
-		config: cfg({ groupPolicy: "open", requireMention: false, batch: { enabled: true, textWindowMs: 30 } }),
+		config: cfg({ groupPolicy: "open", requireMention: false, batch: BATCH }),
 		transport: {} as FeishuTransport,
 		lastSent: new LastSentCache(8),
 		onDispatch: async (m) => { dispatched.push(m); },
@@ -143,12 +147,92 @@ test("全链路：群批量合并后再 dispatch", async () => {
 	assert.equal(dispatched[0].text, "第一条\n第二条");
 });
 
+test("全链路：批处理开启时群非文本消息立即 dispatch", async () => {
+	for (const msgType of ["image", "post", "file"] as const) {
+		const dispatched: FeishuInboundMessage[] = [];
+		const pipeline = new InboundPipeline({
+			config: cfg({ groupPolicy: "open", requireMention: false, batch: BATCH }),
+			transport: {} as FeishuTransport,
+			lastSent: new LastSentCache(8),
+			onDispatch: async (m) => { dispatched.push(m); },
+		});
+		await pipeline.handle(fakeMsg({ messageId: `om_${msgType}`, msgType, text: `[${msgType}]` }));
+		assert.equal(dispatched.length, 1, `${msgType} 不应被 text batch 吞掉`);
+		await pipeline.stop();
+	}
+});
+
+test("全链路：同群不同用户不合并", async () => {
+	const dispatched: FeishuInboundMessage[] = [];
+	const pipeline = new InboundPipeline({
+		config: cfg({ groupPolicy: "open", requireMention: false, groupSessionsPerUser: true, batch: BATCH }),
+		transport: {} as FeishuTransport,
+		lastSent: new LastSentCache(8),
+		onDispatch: async (m) => { dispatched.push(m); },
+	});
+	await pipeline.handle(fakeMsg({ messageId: "om_u1", senderId: "ou_a", text: "A" }));
+	await pipeline.handle(fakeMsg({ messageId: "om_u2", senderId: "ou_b", text: "B" }));
+	await pipeline.stop();
+	assert.deepEqual(dispatched.map((m) => m.text), ["A", "B"]);
+});
+
+test("全链路：同会话不同回复目标不合并且保持顺序", async () => {
+	const dispatched: FeishuInboundMessage[] = [];
+	const transport = new FakeTransport() as unknown as FeishuTransport;
+	const pipeline = new InboundPipeline({
+		config: cfg({ groupPolicy: "open", requireMention: false, batch: BATCH }),
+		transport,
+		lastSent: new LastSentCache(8),
+		onDispatch: async (m) => { dispatched.push(m); },
+	});
+	await pipeline.handle(fakeMsg({ messageId: "om_r1", text: "R1", replyToMessageId: "om_p1" }));
+	await pipeline.handle(fakeMsg({ messageId: "om_r2", text: "R2", replyToMessageId: "om_p2" }));
+	await pipeline.stop();
+	assert.deepEqual(dispatched.map((m) => [m.text, m.replyToMessageId]), [["R1", "om_p1"], ["R2", "om_p2"]]);
+});
+
+test("全链路：达到 maxMessages 时先 flush，stop 再 flush 剩余窗口", async () => {
+	const dispatched: FeishuInboundMessage[] = [];
+	const pipeline = new InboundPipeline({
+		config: cfg({
+			groupPolicy: "open",
+			requireMention: false,
+			batch: { enabled: true, textWindowMs: 10_000, maxMessages: 2, maxChars: 100 },
+		}),
+		transport: {} as FeishuTransport,
+		lastSent: new LastSentCache(8),
+		onDispatch: async (m) => { dispatched.push(m); },
+	});
+	await pipeline.handle(fakeMsg({ messageId: "om_1", text: "1" }));
+	await pipeline.handle(fakeMsg({ messageId: "om_2", text: "2" }));
+	await pipeline.handle(fakeMsg({ messageId: "om_3", text: "3" }));
+	assert.deepEqual(dispatched.map((m) => m.text), ["1\n2"]);
+	await pipeline.stop();
+	assert.deepEqual(dispatched.map((m) => m.text), ["1\n2", "3"]);
+});
+
+test("全链路：达到 maxChars 前先 flush，主聊天与话题窗口隔离", async () => {
+	const dispatched: FeishuInboundMessage[] = [];
+	const pipeline = new InboundPipeline({
+		config: cfg({ groupPolicy: "open", requireMention: false, groupSessionsPerUser: false, batch: { ...BATCH, maxChars: 5 } }),
+		transport: {} as FeishuTransport,
+		lastSent: new LastSentCache(8),
+		onDispatch: async (msg) => { dispatched.push(msg); },
+	});
+	await pipeline.handle(fakeMsg({ messageId: "chars-1", text: "1234", mentions: [{ isSelf: true }] }));
+	await pipeline.handle(fakeMsg({ messageId: "chars-2", text: "56", mentions: [{ isSelf: true }] }));
+	await pipeline.handle(fakeMsg({ messageId: "topic-1", text: "T", chatType: "topic", threadId: "thread-1", mentions: [{ isSelf: true }] }));
+	await pipeline.stop();
+	assert.deepEqual(dispatched.map((msg) => msg.text), ["1234", "56", "T"]);
+	assert.equal(dispatched[2].threadId, "thread-1");
+});
+
 test("全链路：回复 bot 上一条消息免 @ 放行（B1 场景）", async () => {
 	const dispatched: FeishuInboundMessage[] = [];
 	const lastSent = new LastSentCache(8);
 	lastSent.record("om_bot_last");
 	const pipeline = new InboundPipeline({
-		config: cfg({ groupPolicy: "mention", groupAlsoOnReply: true, batch: { enabled: false, textWindowMs: 3000 } }),
+		config: cfg({ groupPolicy: "mention", groupAlsoOnReply: true, batch: NO_BATCH }),
 		transport: new FakeTransport() as unknown as FeishuTransport,
 		lastSent,
 		onDispatch: async (m) => { dispatched.push(m); },
@@ -161,12 +245,76 @@ test("全链路：回复 bot 上一条消息免 @ 放行（B1 场景）", async 
 test("全链路：@_all 放行", async () => {
 	const dispatched: FeishuInboundMessage[] = [];
 	const pipeline = new InboundPipeline({
-		config: cfg({ groupPolicy: "mention", batch: { enabled: false, textWindowMs: 3000 } }),
+		config: cfg({ groupPolicy: "mention", batch: NO_BATCH }),
 		transport: {} as FeishuTransport,
 		lastSent: new LastSentCache(8),
 		onDispatch: async (m) => { dispatched.push(m); },
 	});
 	await pipeline.handle(fakeMsg({ text: "@_all 大家好" }));
+	assert.equal(dispatched.length, 1);
+});
+
+test("全链路：占位解析后的 @all 仍按全员提及放行", async () => {
+	const dispatched: FeishuInboundMessage[] = [];
+	const pipeline = new InboundPipeline({
+		config: cfg({ groupPolicy: "mention", batch: NO_BATCH }), transport: {} as FeishuTransport,
+		lastSent: new LastSentCache(8), onDispatch: async (msg) => { dispatched.push(msg); },
+	});
+	await pipeline.handle(fakeMsg({ text: "@all 大家好", mentions: [] }));
+	assert.equal(dispatched.length, 1);
+});
+
+test("入站命令：显式消费且不进入 batch/Agent，未知斜杠命令仍正常 dispatch", async () => {
+	const commands: string[] = [];
+	const dispatched: string[] = [];
+	const pipeline = new InboundPipeline({
+		config: cfg({ groupPolicy: "open", batch: NO_BATCH }), transport: {} as FeishuTransport,
+		lastSent: new LastSentCache(8),
+		onCommand: async (msg) => { commands.push(msg.text); return msg.text === "/feishu status"; },
+		onDispatch: async (msg) => { dispatched.push(msg.text); },
+	});
+	await pipeline.handle(fakeMsg({ messageId: "cmd-1", chatType: "p2p", text: "/feishu status" }));
+	await pipeline.handle(fakeMsg({ messageId: "cmd-2", chatType: "p2p", text: "/skill:test" }));
+	assert.deepEqual(commands, ["/feishu status", "/skill:test"]);
+	assert.deepEqual(dispatched, ["/skill:test"]);
+});
+
+test("pipeline stop：一个窗口失败不阻止其他窗口 flush", async () => {
+	const dispatched: string[] = [];
+	const pipeline = new InboundPipeline({
+		config: cfg({ groupPolicy: "open", requireMention: false, batch: { ...BATCH, textWindowMs: 60_000 } }),
+		transport: {} as FeishuTransport, lastSent: new LastSentCache(8),
+		onDispatch: async (msg) => { if (msg.chatId === "bad") throw new Error("bad window"); dispatched.push(msg.chatId); },
+	});
+	await pipeline.handle(fakeMsg({ messageId: "stop-bad", chatId: "bad" }));
+	await pipeline.handle(fakeMsg({ messageId: "stop-good", chatId: "good" }));
+	await assert.rejects(() => pipeline.stop(), /failed to flush/);
+	assert.deepEqual(dispatched, ["good"]);
+});
+
+test("pipeline stop：等待正在解析引用的消息并在返回前完成 dispatch", async () => {
+	let releaseQuote: (() => void) | undefined;
+	const dispatched: FeishuInboundMessage[] = [];
+	const transport = {
+		async getMessageText() {
+			await new Promise<void>((resolve) => { releaseQuote = resolve; });
+			return "迟到引用";
+		},
+	} as unknown as FeishuTransport;
+	const pipeline = new InboundPipeline({
+		config: cfg({ groupPolicy: "open", requireMention: false, batch: BATCH }),
+		transport,
+		lastSent: new LastSentCache(8),
+		onDispatch: async (msg) => { dispatched.push(msg); },
+	});
+	const handling = pipeline.handle(fakeMsg({ messageId: "late-quote", replyToMessageId: "parent", mentions: [{ isSelf: true }] }));
+	await new Promise((resolve) => setImmediate(resolve));
+	const stopping = pipeline.stop();
+	releaseQuote?.();
+	await Promise.all([handling, stopping]);
+	assert.equal(dispatched.length, 1);
+	assert.equal(dispatched[0].replyToText, "迟到引用");
+	await pipeline.handle(fakeMsg({ messageId: "after-stop" }));
 	assert.equal(dispatched.length, 1);
 });
 

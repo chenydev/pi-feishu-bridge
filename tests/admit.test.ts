@@ -21,6 +21,7 @@ function groupMsg(over: Partial<FeishuInboundMessage> = {}): FeishuInboundMessag
 		msgType: "text",
 		text: "hi",
 		mentions: [],
+		resources: [],
 		ts: Date.now(),
 		raw: undefined,
 		...over,

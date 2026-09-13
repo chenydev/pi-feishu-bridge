@@ -1,0 +1,35 @@
+{
+  "appId": "cli_xxxxxxxxxxxxxxxx",
+  "appSecret": "replace-me",
+  "domain": "feishu",
+  "groupPolicy": "mention",
+  "allowChats": ["oc_test_chat_id"],
+  "allowUsers": [],
+  "admins": ["ou_admin_open_id"],
+  "groupAlsoOnReply": true,
+  "groupSessionsPerUser": true,
+  "requireMention": true,
+  "groupPolicyByChat": {
+    "oc_test_chat_id": "mention"
+  },
+  "groupRules": {},
+  "batch": {
+    "enabled": true,
+    "textWindowMs": 3000,
+    "maxMessages": 8,
+    "maxChars": 12000
+  },
+  "forwarding": {
+    "acceptMergeForward": true
+  },
+  "approval": {
+    "autoApprove": [],
+    "timeoutMs": 300000
+  },
+  "reaction": {
+    "processingEmoji": "Typing",
+    "enabled": true
+  },
+  "maxActiveSessions": 8,
+  "debug": false
+}

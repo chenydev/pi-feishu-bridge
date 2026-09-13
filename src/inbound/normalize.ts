@@ -4,7 +4,7 @@
  * merge_forward(合并转发递归展开) / share_chat(共享名片) / interactive。
  * 设计依据：docs/DESIGN.md §3.3；参考 hermes feishu adapter normalize 系列函数。
  */
-import type { BotIdentity, FeishuInboundMessage, FeishuMentionRef, InboundMsgType } from "../types.js";
+import type { BotIdentity, FeishuInboundMessage, FeishuMentionRef, InboundMsgType, ResourceRef } from "../types.js";
 
 export const MSG_TYPE_MAP: Record<string, InboundMsgType> = {
 	text: "text",
@@ -66,8 +66,8 @@ function renderCodeBlock(el: PostElement): string {
 export function renderPostElement(el: PostElement): string {
 	if (el.tag === "code_block") return renderCodeBlock(el);
 	const text = renderTextElement(el);
-	if (el.tag === "img" && el.image_key) return `![图片](${el.image_key})`;
-	if (el.tag === "file" && el.file_key) return `[文件](file://${el.file_key})`;
+	if (el.tag === "img" && el.image_key) return "[图片附件]";
+	if (el.tag === "file" && el.file_key) return "[文件附件]";
 	return text;
 }
 
@@ -90,6 +90,24 @@ export function renderPostElements(content: unknown): string {
 		if (Array.isArray(c.lines)) lines.push(renderPostElement(content as PostElement));
 	}
 	return lines.join("\n");
+}
+
+export function collectPostResources(content: unknown, messageId: string): ResourceRef[] {
+	const resources: ResourceRef[] = [];
+	const visit = (value: unknown): void => {
+		if (Array.isArray(value)) {
+			for (const item of value) visit(item);
+			return;
+		}
+		if (!value || typeof value !== "object") return;
+		const element = value as PostElement;
+		if (element.tag === "img" && element.image_key) resources.push({ kind: "image", key: element.image_key, messageId });
+		if (element.tag === "file" && element.file_key) resources.push({ kind: "file", key: element.file_key, messageId });
+		if (element.content) visit(element.content);
+		if (element.lines) visit(element.lines);
+	};
+	visit(content);
+	return resources;
 }
 
 // -------------------------------------------------------- 合并转发 ----
@@ -171,12 +189,12 @@ export function buildMentionsMap(mentions: unknown[] | undefined, bot: BotIdenti
 	const refs: FeishuMentionRef[] = [];
 	for (const raw of mentions) {
 		const m = extractMentionIds(raw);
-		// hermes bot.matches：open_id OR user_id OR name 任一匹配即算自身提及
-		// （聚合群转发消息里 @_user_1 的 open_id 可能是同名其他应用，name 兜底）
-		const isSelf =
-			(m.open_id !== undefined && m.open_id === bot.openId) ||
-			(m.user_id !== undefined && m.user_id === bot.userId) ||
-			(m.name !== undefined && m.name === bot.name);
+		// Hermes 优先级：open_id > user_id > name。当前层两侧都有值时，
+		// 其结果就是权威结论；只有任一侧缺值才允许降级下一层。
+		let isSelf: boolean;
+		if (m.open_id && bot.openId) isSelf = m.open_id === bot.openId;
+		else if (m.user_id && bot.userId) isSelf = m.user_id === bot.userId;
+		else isSelf = Boolean(m.name && bot.name && m.name === bot.name);
 		refs.push({ key: m.key, id: { open_id: m.open_id, user_id: m.user_id, union_id: m.union_id }, name: m.name, isSelf });
 	}
 	return refs;
@@ -198,7 +216,7 @@ const MENTION_PLACEHOLDER_RE = /@_user_\d+/g;
  * @_all → @all；查不到 → @user。
  */
 export function resolveMentionPlaceholders(text: string, mentions: FeishuMentionRef[]): string {
-	if (!text || !MENTION_PLACEHOLDER_RE.test(text)) return text;
+	if (!text || (!MENTION_PLACEHOLDER_RE.test(text) && !text.includes("@_all"))) return text;
 	MENTION_PLACEHOLDER_RE.lastIndex = 0;
 	const byKey = new Map<string, FeishuMentionRef>();
 	for (const m of mentions) {
@@ -250,6 +268,16 @@ export function normalizeFeishuMessage(input: NormalizeInput): FeishuInboundMess
 	const msgType: InboundMsgType = MSG_TYPE_MAP[input.messageType] ?? "unknown";
 	let text = "";
 	let rawContent: unknown;
+	let resources: ResourceRef[] = [];
+	const resourceMeta = (value: Record<string, unknown> | undefined): Partial<Pick<ResourceRef, "name" | "mimeType" | "size">> => {
+		const meta: Partial<Pick<ResourceRef, "name" | "mimeType" | "size">> = {};
+		if (typeof value?.file_name === "string") meta.name = value.file_name;
+		if (typeof value?.mime_type === "string") meta.mimeType = value.mime_type;
+		else if (typeof value?.mime === "string") meta.mimeType = value.mime;
+		if (typeof value?.file_size === "number") meta.size = value.file_size;
+		else if (typeof value?.size === "number") meta.size = value.size;
+		return meta;
+	};
 	try {
 		rawContent = input.content ? JSON.parse(input.content) : undefined;
 	} catch {
@@ -263,7 +291,9 @@ export function normalizeFeishuMessage(input: NormalizeInput): FeishuInboundMess
 			break;
 		}
 		case "post": {
-			text = renderPostElements((rawContent as Record<string, unknown> | undefined)?.content);
+			const content = (rawContent as Record<string, unknown> | undefined)?.content;
+			text = renderPostElements(content);
+			resources = collectPostResources(content, input.messageId);
 			break;
 		}
 		case "merge_forward": {
@@ -278,22 +308,26 @@ export function normalizeFeishuMessage(input: NormalizeInput): FeishuInboundMess
 		}
 		case "image": {
 			const img = rawContent as Record<string, unknown> | undefined;
-			text = img?.image_key ? `![图片](image_key:${img.image_key})` : "[图片]";
+			text = "[图片附件]";
+			if (typeof img?.image_key === "string") resources.push({ kind: "image", key: img.image_key, messageId: input.messageId });
 			break;
 		}
 		case "video": {
 			const v = rawContent as Record<string, unknown> | undefined;
-			text = v?.file_key ? `[视频](file_key:${v.file_key})` : "[视频]";
+			text = "[视频附件]";
+			if (typeof v?.file_key === "string") resources.push({ kind: "video", key: v.file_key, messageId: input.messageId, ...resourceMeta(v) });
 			break;
 		}
 		case "audio": {
 			const a = rawContent as Record<string, unknown> | undefined;
-			text = a?.file_key ? `[语音](file_key:${a.file_key})` : "[语音]";
+			text = "[语音附件]";
+			if (typeof a?.file_key === "string") resources.push({ kind: "audio", key: a.file_key, messageId: input.messageId, ...resourceMeta(a) });
 			break;
 		}
 		case "file": {
 			const f = rawContent as Record<string, unknown> | undefined;
 			text = f?.file_name ? `[文件] ${f.file_name}` : "[文件]";
+			if (typeof f?.file_key === "string") resources.push({ kind: "file", key: f.file_key, messageId: input.messageId, ...resourceMeta(f) });
 			break;
 		}
 		case "interactive": {
@@ -322,6 +356,7 @@ export function normalizeFeishuMessage(input: NormalizeInput): FeishuInboundMess
 		msgType,
 		text: finalText,
 		mentions,
+		resources,
 		replyToMessageId: input.parentId ?? input.upperMessageId ?? input.rootId ?? undefined,
 		threadId: input.threadId ?? undefined,
 		raw: input,

@@ -5,6 +5,7 @@
 import { randomUUID } from "node:crypto";
 import type { BridgeConfig, SendOptions, SendResult } from "../types.js";
 import type { FeishuTransport } from "../inbound/transport.js";
+import { readVerifiedArtifact, type ValidatedArtifact } from "./artifact.js";
 
 export const MAX_MESSAGE_LENGTH = 16_000;
 const MARKDOWN_HINT_RE = /(```|^#{1,6}\s|^\s*[-*]\s|^\s*\d+\.\s|\|.*\|)/m;
@@ -15,17 +16,61 @@ export interface SenderDeps {
 	/** 发送成功后回调（用于 LastSentCache 记录 replyToBot 判定）。 */
 	onSent?: (chatId: string, messageId: string) => void;
 	log?: (level: "debug" | "info" | "warn" | "error", msg: string, meta?: unknown) => void;
+	setTimer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+	clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 }
 
 interface SendResponse {
 	code?: number;
 	msg?: string;
+	retry_after?: number;
+	retry_after_ms?: number;
 	data?: { message_id?: string };
+}
+
+export interface PreparedSend {
+	chatId: string;
+	msgType: "text" | "post";
+	payload: string;
+	plainTextPayload: string;
+	opts: SendOptions;
+	uuid: string;
+	contentFallbackUuid: string;
+	routeFallbackUuid: string;
+}
+
+export interface PreparedMediaSend extends ValidatedArtifact {
+	type: "media";
+	chatId: string;
+	opts: SendOptions;
+	uuid: string;
+	routeFallbackUuid: string;
+	uploadKey?: string;
+	uploadedAsFile?: boolean;
+}
+
+export type PreparedDelivery = PreparedSend | PreparedMediaSend;
+export type DeliveryCheckpoint = (patch: Partial<PreparedMediaSend>) => void;
+
+export function isPreparedMedia(request: PreparedDelivery): request is PreparedMediaSend {
+	return (request as PreparedMediaSend).type === "media";
+}
+
+export function feishuMessageTypeForMedia(mediaType: PreparedMediaSend["mediaType"]): "image" | "file" | "media" | "audio" {
+	return mediaType === "video" ? "media" : mediaType;
 }
 
 function responseSucceeded(res: unknown): res is SendResponse {
 	const r = res as SendResponse | undefined;
-	return Boolean(r && typeof r === "object" && (r.code === 0 || r.code === undefined));
+	return Boolean(r && typeof r === "object" && r.code === 0);
+}
+
+function errorToResult(error: unknown): SendResult {
+	const err = error as Error & { code?: number; response?: { status?: number; data?: { code?: number; msg?: string } } };
+	const code = err.response?.data?.code ?? err.response?.status ?? err.code;
+	const message = err.response?.data?.msg ?? err.message ?? String(error);
+	const retryable = code === undefined || code === 408 || code === 429 || (code >= 500 && code < 600) || /(?:timeout|network|temporar|unavailable|ECONN)/i.test(message);
+	return { success: false, error: message, retryable, errorCode: code };
 }
 
 /** 撤回/不存在/权限等 reply 失败码 → 回退为 create（hermes _FEISHU_REPLY_FALLBACK_CODES 思路）。 */
@@ -115,53 +160,127 @@ export class Sender {
 	 * @returns 最后 chunk 的结果；多 chunk 时首 chunk 失败即抛（调用方处理）。
 	 */
 	async send(chatId: string, content: string, opts: SendOptions = {}): Promise<SendResult> {
-		const chunks = truncateMessage(content);
-		const preferPost = Boolean(buildMarkdownPostPayload(content));
+		const prepared = this.prepare(chatId, content, opts);
 		let last: SendResult = { success: false, error: "empty" };
-		for (const chunk of chunks) {
-			last = await this.sendChunk(chatId, chunk, opts, preferPost);
+		for (const request of prepared) {
+			last = await this.sendPrepared(request);
 			if (!last.success) return last;
-			if (last.messageId) {
-				this.deps.onSent?.(chatId, last.messageId);
-			}
 		}
 		return last;
 	}
 
-	private async sendChunk(chatId: string, chunk: string, opts: SendOptions, preferPost: boolean): Promise<SendResult> {
-		const key = `${chatId}:${opts.replyTo ?? "new"}:${chunk.slice(0, 40)}`;
+	/** 将一条逻辑消息渲染为可持久化的 API 请求；每个 chunk 有独立且稳定的 UUID。 */
+	prepare(chatId: string, content: string, opts: SendOptions = {}): PreparedSend[] {
+		const preferPost = Boolean(buildMarkdownPostPayload(content));
+		return truncateMessage(content).map((chunk, index) => {
+			const post = preferPost ? buildMarkdownPostPayload(chunk) : undefined;
+			return {
+				chatId,
+				msgType: post ? "post" : "text",
+				payload: post ?? JSON.stringify({ text: chunk }),
+				plainTextPayload: JSON.stringify({ text: stripMarkdownToPlainText(chunk) }),
+				opts: { ...opts, editMessageId: index === 0 ? opts.editMessageId : undefined },
+				uuid: randomUUID(),
+				contentFallbackUuid: randomUUID(),
+				routeFallbackUuid: randomUUID(),
+			};
+		});
+	}
+
+	prepareMedia(chatId: string, artifact: ValidatedArtifact, opts: SendOptions = {}): PreparedMediaSend {
+		return {
+			type: "media",
+			...artifact,
+			chatId,
+			opts: { ...opts },
+			uuid: randomUUID(),
+			routeFallbackUuid: randomUUID(),
+		};
+	}
+
+	/** 发送一个已渲染请求；供 durable outbox 重试，同一对象的 UUID 始终不变。 */
+	async sendPrepared(request: PreparedDelivery, checkpoint?: DeliveryCheckpoint): Promise<SendResult> {
+		const key = request.uuid;
 		const inflight = this.sending.get(key);
 		if (inflight) return inflight; // 同内容并发去重（幂等辅助）
 
-		const p = this.doSendChunk(chatId, chunk, opts, preferPost);
+		const p = isPreparedMedia(request) ? this.doSendMedia(request, checkpoint) : this.doSendPrepared(request);
 		this.sending.set(key, p);
 		try {
-			return await p;
+			const result = await p;
+			if (result.success && result.messageId) this.deps.onSent?.(request.chatId, result.messageId);
+			return result;
 		} finally {
 			this.sending.delete(key);
 		}
 	}
 
-	private async doSendChunk(chatId: string, chunk: string, opts: SendOptions, preferPost: boolean): Promise<SendResult> {
-		let msgType = "text" as "text" | "post";
-		let payload = JSON.stringify({ text: chunk }, (_, v) => v);
-		if (preferPost) {
-			const post = buildMarkdownPostPayload(chunk);
-			if (post) {
-				msgType = "post";
-				payload = post;
-			}
-		}
-		const uuidValue = randomUUID();
-
+	private async doSendMedia(request: PreparedMediaSend, checkpoint?: DeliveryCheckpoint): Promise<SendResult> {
 		try {
-			let res = await this.rawSend(chatId, msgType, payload, opts, uuidValue);
+			let uploadKey = request.uploadKey;
+			if (!uploadKey) {
+				const buffer = readVerifiedArtifact(request);
+				if (request.mediaType === "image") uploadKey = await this.deps.transport.uploadImage(buffer);
+				else {
+					const nativeType = request.mediaType === "video" ? "mp4" : request.mediaType === "audio" ? "opus" : "stream";
+					try {
+						uploadKey = await this.deps.transport.uploadFile(request.fileName, buffer, nativeType);
+					} catch (error) {
+						const detail = error instanceof Error ? error.message : String(error);
+						if (nativeType === "stream" || !/(?:unsupported|not support|file.?type|invalid.*(?:mp4|opus)|234006)/i.test(detail)) throw error;
+						this.deps.log?.("warn", "feishu.sender.media_fallback_file", { mediaType: request.mediaType, error: detail.slice(0, 160) });
+						uploadKey = await this.deps.transport.uploadFile(request.fileName, buffer, "stream");
+						request.uploadedAsFile = true;
+					}
+				}
+				request.uploadKey = uploadKey;
+				checkpoint?.({ uploadKey, uploadedAsFile: request.uploadedAsFile });
+			}
+			const msgType = request.uploadedAsFile ? "file" : feishuMessageTypeForMedia(request.mediaType);
+			const content = JSON.stringify(request.mediaType === "image" ? { image_key: uploadKey } : { file_key: uploadKey });
+			let response = await this.rawSend(request.chatId, msgType, content, request.opts, request.uuid);
+			if (request.opts.replyTo && !responseSucceeded(response)) {
+				const code = (response as SendResponse)?.code;
+				if (code !== undefined && REPLY_FALLBACK_CODES.has(code)) {
+					response = await this.rawSend(request.chatId, msgType, content, { ...request.opts, replyTo: undefined }, request.routeFallbackUuid);
+					return this.toResult(response, true);
+				}
+			}
+			return this.toResult(response);
+		} catch (error) {
+			return errorToResult(error);
+		}
+	}
+
+	private async doSendPrepared(request: PreparedSend): Promise<SendResult> {
+		const { chatId, opts } = request;
+		try {
+			let msgType = request.msgType;
+			let payload = request.payload;
+			if (opts.editMessageId) {
+				try {
+					const edited = await this.rawEdit(opts.editMessageId, msgType, payload);
+					if (responseSucceeded(edited)) return this.toResult(edited, false, false);
+					const code = (edited as SendResponse)?.code;
+					if (code !== undefined && !REPLY_FALLBACK_CODES.has(code)) return this.toResult(edited);
+				} catch (error) {
+					const status = (error as { response?: { status?: number; data?: { code?: number } } }).response;
+					const code = status?.data?.code ?? status?.status;
+					if (code !== 404 && (code === undefined || !REPLY_FALLBACK_CODES.has(code))) throw error;
+				}
+				const fallbackOpts = { ...opts, editMessageId: undefined };
+				const fallback = await this.rawSend(chatId, msgType, payload, fallbackOpts, request.routeFallbackUuid);
+				return this.toResult(fallback, true);
+			}
+			let res = await this.rawSend(chatId, msgType, payload, opts, request.uuid);
 			// post 内容被 API 拒绝 → 降级 text 重发
-			if (msgType === "post" && !responseSucceeded(res)) {
+			if (request.msgType === "post" && !responseSucceeded(res)) {
 				const code = (res as SendResponse)?.code;
 				if (code && code !== 0 && /post|content|param/i.test((res as SendResponse)?.msg ?? "")) {
 					this.deps.log?.("warn", "feishu.sender.post_fallback", { code, msg: (res as SendResponse)?.msg });
-					res = await this.rawSend(chatId, "text", JSON.stringify({ text: stripMarkdownToPlainText(chunk) }), opts, randomUUID());
+					msgType = "text";
+					payload = request.plainTextPayload;
+					res = await this.rawSend(chatId, msgType, payload, opts, request.contentFallbackUuid);
 				}
 			}
 			// reply 失败（撤回/不存在）→ 降级 create
@@ -169,27 +288,42 @@ export class Sender {
 				const code = (res as SendResponse)?.code;
 				if (code !== undefined && REPLY_FALLBACK_CODES.has(code)) {
 					this.deps.log?.("warn", "feishu.sender.reply_fallback", { code, replyTo: opts.replyTo, chatId });
-					res = await this.rawSend(chatId, msgType, payload, { ...opts, replyTo: undefined }, randomUUID());
+					res = await this.rawSend(chatId, msgType, payload, { ...opts, replyTo: undefined }, request.routeFallbackUuid);
 					return this.toResult(res, true);
 				}
 			}
 			return this.toResult(res);
 		} catch (err) {
 			this.deps.log?.("error", "feishu.sender.error", { error: err instanceof Error ? err.message : String(err) });
-			return { success: false, error: err instanceof Error ? err.message : String(err) };
+			return errorToResult(err);
 		}
 	}
 
-	private toResult(res: unknown, fallback = false): SendResult {
+	private async rawEdit(messageId: string, msgType: "text" | "post", payload: string): Promise<unknown> {
+		return this.withTimeout(this.deps.transport.rawRequest({
+			url: `/open-apis/im/v1/messages/${messageId}`,
+			method: "PUT",
+			data: { content: payload, msg_type: msgType },
+		}));
+	}
+
+	private toResult(res: unknown, fallback = false, messageIdRequired = true): SendResult {
 		if (responseSucceeded(res)) {
 			const messageId = (res as SendResponse)?.data?.message_id;
-			return { success: true, messageId, fallback };
+			if (!messageIdRequired || (typeof messageId === "string" && messageId.length > 0)) return { success: true, messageId, fallback };
+			return { success: false, error: "0: missing message_id", fallback, retryable: true, errorCode: 0 };
 		}
 		const r = res as SendResponse;
-		return { success: false, error: `${r?.code ?? "?"}: ${r?.msg ?? "unknown"}`, fallback };
+		const code = r?.code;
+		const message = r?.msg ?? "unknown";
+		const retryable = code === undefined || code === 429 || (typeof code === "number" && code >= 500 && code < 600) || /(?:rate.?limit|too many|timeout|temporar|network|unavailable)/i.test(message);
+		const retryAfterMs = typeof r?.retry_after_ms === "number"
+			? r.retry_after_ms
+			: typeof r?.retry_after === "number" ? r.retry_after * 1_000 : undefined;
+		return { success: false, error: `${code ?? "?"}: ${message}`, fallback, retryable, errorCode: code, retryAfterMs };
 	}
 
-	private async rawSend(chatId: string, msgType: "text" | "post", payload: string, opts: SendOptions, uuidValue: string): Promise<unknown> {
+	private async rawSend(chatId: string, msgType: "text" | "post" | "image" | "file" | "media" | "audio", payload: string, opts: SendOptions, uuidValue: string): Promise<unknown> {
 		const req = opts.replyTo
 			? this.deps.transport.rawRequest({
 					url: `/open-apis/im/v1/messages/${opts.replyTo}/reply`,
@@ -202,10 +336,22 @@ export class Sender {
 					params: opts.threadId ? { receive_id_type: "thread_id" } : { receive_id_type: "chat_id" },
 					data: { receive_id: opts.threadId ?? chatId, msg_type: msgType, content: payload, uuid: uuidValue },
 				});
-		// 30s 超时保护：SDK request 偶发 hang（实测：无超时时回复静默丢失）
-		return Promise.race([
-			req,
-			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("request timeout after 30s")), 30_000)),
-		]);
+		// 30s 超时保护：请求 settle 后必须清掉落败的 timer，否则每次成功发送
+		// 都会让进程额外挂住 30 秒。
+		return this.withTimeout(req);
+	}
+
+	private async withTimeout<T>(request: Promise<T>): Promise<T> {
+		const setTimer = this.deps.setTimer ?? setTimeout;
+		const clearTimer = this.deps.clearTimer ?? clearTimeout;
+		let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timeoutTimer = setTimer(() => reject(new Error("request timeout after 30s")), 30_000);
+		});
+		try {
+			return await Promise.race([request, timeout]);
+		} finally {
+			if (timeoutTimer) clearTimer(timeoutTimer);
+		}
 	}
 }

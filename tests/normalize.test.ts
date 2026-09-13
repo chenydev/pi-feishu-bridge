@@ -43,6 +43,40 @@ test("post 富文本 → markdown", () => {
 	assert.match(msg.text, /\*\*粗体\*\*/);
 });
 
+test("媒体消息生成结构化 ResourceRef，不伪造可访问 URL", () => {
+	const image = normalizeFeishuMessage(base({ messageId: "om_img", messageType: "image", content: '{"image_key":"img_key"}' }));
+	assert.deepEqual(image.resources, [{ kind: "image", key: "img_key", messageId: "om_img" }]);
+	assert.equal(image.text, "[图片附件]");
+	assert.doesNotMatch(image.text, /image_key:|file:\/\//);
+
+	const file = normalizeFeishuMessage(base({ messageId: "om_file", messageType: "file", content: '{"file_key":"file_key","file_name":"report.txt"}' }));
+	assert.deepEqual(file.resources, [{ kind: "file", key: "file_key", messageId: "om_file", name: "report.txt" }]);
+
+	const post = normalizeFeishuMessage(base({
+		messageId: "om_post_media",
+		messageType: "post",
+		content: JSON.stringify({ content: [[{ tag: "img", image_key: "post_img" }, { tag: "file", file_key: "post_file" }]] }),
+	}));
+	assert.deepEqual(post.resources, [
+		{ kind: "image", key: "post_img", messageId: "om_post_media" },
+		{ kind: "file", key: "post_file", messageId: "om_post_media" },
+	]);
+	assert.doesNotMatch(post.text, /post_img|post_file|file:\/\//);
+});
+
+test("文件消息保留声明大小与 MIME，post @_all 正规化", () => {
+	const file = normalizeFeishuMessage(base({
+		messageType: "file",
+		content: JSON.stringify({ file_key: "fk", file_name: "a.txt", file_size: 12, mime_type: "text/plain" }),
+	}));
+	assert.deepEqual(file.resources, [{ kind: "file", key: "fk", messageId: "om_1", name: "a.txt", mimeType: "text/plain", size: 12 }]);
+	const post = normalizeFeishuMessage(base({
+		messageType: "post",
+		content: JSON.stringify({ content: [[{ tag: "at", user_id: "@_all" }, { tag: "text", text: " 大家" }]] }),
+	}));
+	assert.equal(post.text, "@all 大家");
+});
+
 test("code_block 渲染", () => {
 	const out = renderPostElements({ content: [[{ tag: "code_block", language: "ts", lines: ["const a = 1;", "console.log(a)"] }]] });
 	assert.match(out, /```ts/);
@@ -75,9 +109,9 @@ test("mention ID 匹配（open_id）", () => {
 	assert.equal(mentions[0].isSelf, true);
 });
 
-test("mention ID 不匹配但 name 匹配 → isSelf（hermes OR 语义：同名其他应用兜底）", () => {
+test("mention ID 不匹配时不允许 name 翻案（Hermes ID 优先）", () => {
 	const mentions = buildMentionsMap([{ id: { open_id: "ou_other" }, name: "小助手" }], BOT);
-	assert.equal(mentions[0].isSelf, true);
+	assert.equal(mentions[0].isSelf, false);
 });
 
 test("mention 缺 ID → name 兜底命中", () => {
