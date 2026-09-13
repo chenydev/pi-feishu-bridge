@@ -12,11 +12,30 @@ export interface ExtensionCommandContext {
 	session: unknown;
 }
 
+export interface ExtensionRuntimeContext {
+	cwd: string;
+	sessionManager: { getSessionId(): string };
+}
+
+export interface ExtensionToolResult {
+	content: Array<{ type: "text"; text: string }>;
+	details?: unknown;
+	isError?: boolean;
+}
+
 export interface ExtensionAPI {
 	getAgentDir(): string;
 	getPackageDir(): string;
 	ui: ExtensionUI;
-	on(event: string, handler: (event: unknown, ctx: ExtensionAPI) => void | Promise<void>): void;
+	on(event: string, handler: (event: unknown, ctx: ExtensionRuntimeContext) => unknown | Promise<unknown>): void;
+	registerTool(tool: {
+		name: string;
+		label: string;
+		description: string;
+		promptSnippet?: string;
+		parameters: Record<string, unknown>;
+		execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: ExtensionRuntimeContext): Promise<ExtensionToolResult>;
+	}): void;
 	registerCommand(
 		name: string,
 		opts: {
@@ -26,4 +45,3 @@ export interface ExtensionAPI {
 	): void;
 	appendEntry(customType: string, data: unknown): void;
 }
-

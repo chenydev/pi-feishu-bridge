@@ -2,7 +2,8 @@
  * 配置加载：env 优先，config.json 持久化合并（写回保留 groupPolicyByChat 等运行时改动）。
  * 设计依据：docs/DESIGN.md §5。
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { BridgeConfig, GroupPolicy } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
@@ -12,6 +13,8 @@ export interface ConfigPaths {
 	statusFile: string;
 	sessionDir: string;
 	outboxFile: string;
+	dedupeFile: string;
+	knownChatsFile: string;
 }
 
 export function resolvePaths(homeDir: string): ConfigPaths {
@@ -20,11 +23,19 @@ export function resolvePaths(homeDir: string): ConfigPaths {
 		statusFile: join(homeDir, "feishu-bridge", "status.json"),
 		sessionDir: join(homeDir, "feishu-bridge", "sessions"),
 		outboxFile: join(homeDir, "feishu-bridge", "outbox.jsonl"),
+		dedupeFile: join(homeDir, "feishu-bridge", "dedupe.jsonl"),
+		knownChatsFile: join(homeDir, "feishu-bridge", "known-chats.json"),
 	};
 }
 
+export function resolveAppLockFile(homeDir: string, appId: string): string {
+	const safeAppId = appId.replace(/[^a-zA-Z0-9_-]/g, "_");
+	const identity = createHash("sha256").update(appId).digest("hex").slice(0, 12);
+	return join(homeDir, "feishu-bridge", `bridge-${safeAppId.slice(0, 48)}-${identity}.lock`);
+}
+
 function parseGroupPolicy(v: unknown): GroupPolicy | undefined {
-	if (v === "open" || v === "mention" || v === "disabled" || v === "allowlist") return v;
+	if (v === "open" || v === "mention" || v === "disabled" || v === "allowlist" || v === "blacklist" || v === "admin_only") return v;
 	return undefined;
 }
 
@@ -36,12 +47,36 @@ function toBool(v: unknown, dflt: boolean): boolean {
 }
 
 function loadJson<T>(file: string): T | undefined {
+	if (!existsSync(file)) return undefined;
 	try {
-		if (!existsSync(file)) return undefined;
 		return JSON.parse(readFileSync(file, "utf8")) as T;
-	} catch {
-		return undefined;
+	} catch (error) {
+		throw new Error(`invalid JSON config ${file}: ${error instanceof Error ? error.message : String(error)}`);
 	}
+}
+
+function requireGroupPolicy(value: unknown, source: string): GroupPolicy {
+	const policy = parseGroupPolicy(value);
+	if (!policy) throw new Error(`invalid group policy at ${source}: ${String(value)}`);
+	return policy;
+}
+
+function requireStringArray(value: unknown, source: string): string[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) throw new Error(`invalid string array at ${source}`);
+	return value;
+}
+
+function validateGroupRule(value: unknown, source: string): import("./types.js").GroupRule {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`invalid group rule at ${source}`);
+	const raw = value as Record<string, unknown>;
+	if (raw.requireMention !== undefined && typeof raw.requireMention !== "boolean") throw new Error(`invalid boolean at ${source}.requireMention`);
+	return {
+		policy: raw.policy === undefined ? undefined : requireGroupPolicy(raw.policy, `${source}.policy`),
+		allowlist: requireStringArray(raw.allowlist, `${source}.allowlist`),
+		blacklist: requireStringArray(raw.blacklist, `${source}.blacklist`),
+		requireMention: raw.requireMention as boolean | undefined,
+	};
 }
 
 /**
@@ -52,28 +87,45 @@ function loadJson<T>(file: string): T | undefined {
  */
 export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env): BridgeConfig {
 	const paths = resolvePaths(homeDir);
+	if (existsSync(paths.configFile)) {
+		try { chmodSync(paths.configFile, 0o600); } catch { /* 只读文件系统仍由后续读取决定是否可用 */ }
+	}
 	const fileCfg = loadJson<Partial<BridgeConfig>>(paths.configFile) ?? {};
-	const merged: BridgeConfig = { ...DEFAULT_CONFIG, ...fileCfg };
+	const merged: BridgeConfig = {
+		...DEFAULT_CONFIG,
+		...fileCfg,
+		// 旧版配置可能只保存 enabled/textWindowMs；逐字段合并以继承 V2 上限。
+		batch: { ...DEFAULT_CONFIG.batch, ...fileCfg.batch },
+		forwarding: { ...DEFAULT_CONFIG.forwarding, ...fileCfg.forwarding },
+		approval: { ...DEFAULT_CONFIG.approval, ...fileCfg.approval },
+		reaction: { ...DEFAULT_CONFIG.reaction, ...fileCfg.reaction },
+	};
+	merged.groupPolicy = requireGroupPolicy((fileCfg as Record<string, unknown>).groupPolicy ?? merged.groupPolicy, "config.groupPolicy");
+	if (merged.defaultGroupPolicy !== undefined) merged.defaultGroupPolicy = requireGroupPolicy(merged.defaultGroupPolicy, "config.defaultGroupPolicy");
+	for (const [chatId, policy] of Object.entries(merged.groupPolicyByChat)) {
+		merged.groupPolicyByChat[chatId] = requireGroupPolicy(policy, `config.groupPolicyByChat.${chatId}`);
+	}
+	for (const [chatId, rule] of Object.entries(merged.groupRules)) {
+		merged.groupRules[chatId] = validateGroupRule(rule, `config.groupRules.${chatId}`);
+	}
 
 	// ---- env 覆盖 ----
 	if (env.FEISHU_APP_ID) merged.appId = env.FEISHU_APP_ID;
 	if (env.FEISHU_APP_SECRET) merged.appSecret = env.FEISHU_APP_SECRET;
 	if (env.FEISHU_DOMAIN === "feishu" || env.FEISHU_DOMAIN === "lark") merged.domain = env.FEISHU_DOMAIN;
 	if (env.FEISHU_GROUP_POLICY) {
-		const p = parseGroupPolicy(env.FEISHU_GROUP_POLICY);
-		if (p) merged.groupPolicy = p;
+		merged.groupPolicy = requireGroupPolicy(env.FEISHU_GROUP_POLICY, "FEISHU_GROUP_POLICY");
 	}
 	if (env.FEISHU_GROUP_POLICY_BY_CHAT) {
 		try {
 			const parsed = JSON.parse(env.FEISHU_GROUP_POLICY_BY_CHAT) as Record<string, unknown>;
 			const clean: Record<string, GroupPolicy> = {};
 			for (const [k, v] of Object.entries(parsed)) {
-				const p = parseGroupPolicy(v);
-				if (p) clean[k] = p;
+				clean[k] = requireGroupPolicy(v, `FEISHU_GROUP_POLICY_BY_CHAT.${k}`);
 			}
 			merged.groupPolicyByChat = clean;
-		} catch {
-			/* 忽略非法 env JSON */
+		} catch (error) {
+			throw new Error(`invalid FEISHU_GROUP_POLICY_BY_CHAT: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 	const csv = (v: string | undefined): string[] => (v ? v.split(",").map((s) => s.trim()).filter(Boolean) : []);
@@ -81,21 +133,10 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 		try {
 			const parsed = JSON.parse(env.FEISHU_GROUP_RULES) as Record<string, unknown>;
 			const clean: Record<string, import("./types.js").GroupRule> = {};
-			for (const [k, v] of Object.entries(parsed)) {
-				if (v && typeof v === "object") {
-					const r = v as Record<string, unknown>;
-					const rule: import("./types.js").GroupRule = {};
-					const p = parseGroupPolicy(r.policy);
-					if (p) rule.policy = p;
-					if (Array.isArray(r.allowlist)) rule.allowlist = r.allowlist.map(String);
-					if (Array.isArray(r.blacklist)) rule.blacklist = r.blacklist.map(String);
-					if (typeof r.requireMention === "boolean") rule.requireMention = r.requireMention;
-					clean[k] = rule;
-				}
-			}
+			for (const [k, v] of Object.entries(parsed)) clean[k] = validateGroupRule(v, `FEISHU_GROUP_RULES.${k}`);
 			merged.groupRules = clean;
-		} catch {
-			/* 忽略非法 env JSON */
+		} catch (error) {
+			throw new Error(`invalid FEISHU_GROUP_RULES: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 	if (env.FEISHU_ALLOW_CHATS) merged.allowChats = csv(env.FEISHU_ALLOW_CHATS);
@@ -120,7 +161,9 @@ export function saveConfig(homeDir: string, cfg: BridgeConfig): boolean {
 	try {
 		const paths = resolvePaths(homeDir);
 		mkdirSync(dirname(paths.configFile), { recursive: true });
-		writeFileSync(paths.configFile, JSON.stringify(cfg, null, 2), { encoding: "utf8" });
+		const tmp = `${paths.configFile}.tmp`;
+		writeFileSync(tmp, JSON.stringify(cfg, null, 2), { encoding: "utf8", mode: 0o600 });
+		renameSync(tmp, paths.configFile);
 		return true;
 	} catch {
 		return false;

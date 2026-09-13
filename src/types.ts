@@ -18,6 +18,8 @@ export interface GroupRule {
 export interface BatchConfig {
 	enabled: boolean;
 	textWindowMs: number; // 同一 chat 多条 text 的合并窗口
+	maxMessages: number;
+	maxChars: number;
 }
 
 export interface BridgeConfig {
@@ -61,6 +63,9 @@ export interface BridgeConfig {
 	quotedFetchTtlMs: number;
 	/** 入站去重缓存容量 */
 	dedupCacheSize: number;
+	dedupTtlMs: number;
+	/** 同时执行的 Pi 会话上限；其余 conversation 在内存队列等待。 */
+	maxActiveSessions: number;
 }
 
 export const DEFAULT_CONFIG: BridgeConfig = {
@@ -76,7 +81,7 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 	groupAlsoOnReply: true,
 	groupSessionsPerUser: true,
 	requireMention: true,
-	batch: { enabled: true, textWindowMs: 3000 },
+	batch: { enabled: true, textWindowMs: 3000, maxMessages: 8, maxChars: 12_000 },
 	forwarding: { acceptMergeForward: true },
 	approval: { autoApprove: [], timeoutMs: 300_000 },
 	reaction: { processingEmoji: "Typing", enabled: true },
@@ -85,6 +90,8 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 	lastSentCacheSize: 64,
 	quotedFetchTtlMs: 5 * 60_000,
 	dedupCacheSize: 4096,
+	dedupTtlMs: 24 * 60 * 60_000,
+	maxActiveSessions: 8,
 };
 
 // ------------------------------------------------------------ 入站消息 ----
@@ -99,6 +106,22 @@ export interface FeishuMentionRef {
 	isSelf: boolean;
 }
 
+export interface ResourceRef {
+	kind: "image" | "video" | "audio" | "file";
+	key: string;
+	messageId: string;
+	name?: string;
+	mimeType?: string;
+	size?: number;
+}
+
+export interface PiImageContent {
+	type: "image";
+	/** 裸 base64，不含 data: URI 前缀。 */
+	data: string;
+	mimeType: string;
+}
+
 export interface FeishuInboundMessage {
 	messageId: string;
 	chatId: string;
@@ -109,6 +132,7 @@ export interface FeishuInboundMessage {
 	msgType: InboundMsgType;
 	text: string;
 	mentions: FeishuMentionRef[];
+	resources: ResourceRef[];
 	/** 回复链路：被回复消息 id（parent_id ?? upper_message_id ?? root_id） */
 	replyToMessageId?: string;
 	/** 被回复消息原文（API 拉取；失败为占位文本） */
@@ -117,6 +141,8 @@ export interface FeishuInboundMessage {
 	threadId?: string;
 	raw: unknown;
 	ts: number;
+	/** batch 后保留所有原始事件 id，供恢复审计。 */
+	sourceMessageIds?: string[];
 }
 
 export type AdmitReason = "self_echo" | "bots_disabled" | "bot_not_mentioned" | "dm_policy_rejected" | "group_policy_rejected" | "not_allowlisted";
@@ -126,6 +152,8 @@ export type AdmitReason = "self_echo" | "bots_disabled" | "bot_not_mentioned" | 
 export interface SendOptions {
 	replyTo?: string;
 	threadId?: string;
+	/** durable final 覆盖此前易失流式消息；编辑目标失效时回退 reply/create。 */
+	editMessageId?: string;
 }
 
 export interface SendResult {
@@ -133,6 +161,9 @@ export interface SendResult {
 	messageId?: string;
 	error?: string;
 	fallback?: boolean; // 是否发生过 reply→create 回退
+	retryable?: boolean;
+	errorCode?: number;
+	retryAfterMs?: number;
 }
 
 export class RetryableError extends Error {}
@@ -145,19 +176,25 @@ export interface SessionBackend {
 		chatId: string;
 		conversationKey: string;
 		sessionFile?: string;
-	}): Promise<{
-		sessionId: string;
-		prompt(text: string, images?: unknown[]): Promise<unknown>;
-		subscribe(fn: (event: unknown) => void): () => void;
-		modelId: string;
-	}>;
+		}): Promise<{
+			sessionId: string;
+			prompt(text: string, images?: PiImageContent[]): Promise<unknown>;
+			steer?(text: string, images?: PiImageContent[]): Promise<void>;
+			followUp?(text: string, images?: PiImageContent[]): Promise<void>;
+			subscribe(fn: (event: unknown) => void): () => void;
+			abort(): Promise<void>;
+			dispose(): Promise<void>;
+			modelId: string;
+			compact?(instructions?: string): Promise<string>;
+			setModel?(modelId: string): Promise<boolean>;
+		}>;
 }
 
 export interface BridgeSessionState {
 	chatId: string;
 	conversationKey: string;
 	sessionFile: string;
-	queue: Array<{ text: string; images: unknown[]; messageId: string; replyToMessageId?: string; replyToText?: string }>;
+	queue: Array<{ text: string; images: PiImageContent[]; messageId: string; replyToMessageId?: string; replyToText?: string }>;
 	activeRun: boolean;
 	lastReplyId?: string;
 	busySince?: number;
@@ -166,16 +203,34 @@ export interface BridgeSessionState {
 // ------------------------------------------------------------ 状态 ----
 
 export interface BridgeStatus {
+	appId?: string;
+	pid?: number;
+	updatedAt?: number;
 	connState: "disconnected" | "connecting" | "connected" | "error";
+	downSince?: number;
+	lastError?: string;
 	reconnectCount: number;
 	startedAt?: number;
 	botOpenId?: string;
 	botName?: string;
 	conversations: number;
+	sessionQueues?: { queued: number; active: number; waiting: number };
+	pendingApprovals?: number;
 	outboxDepth: number;
+	outbox: {
+		pending: number;
+		sending: number;
+		sent: number;
+		failed: number;
+		lanes: number;
+		oldestAgeMs: number;
+	};
 	lastMessageAt?: number;
 	messageTotal: number;
 	messageDropped: number;
+	compensatedMessages: number;
+	compensationErrors: number;
+	compensationTruncated: number;
 }
 
 export interface BotIdentity {
