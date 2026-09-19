@@ -40,11 +40,34 @@ const READ_ONLY_COMMANDS = new Set([
 	"git", "jq", "yq", "tree", "basename", "dirname", "realpath", "readlink", "env", "printenv",
 ]);
 
-/** `git` 的只读子命令；其余（push/commit/reset/clean…）一律走审批。 */
+/** `git` 中**永远只读**的子命令；其余（push/commit/reset/clean…）一律走审批。 */
 const GIT_READ_ONLY_SUBCOMMANDS = new Set([
-	"status", "diff", "log", "show", "branch", "tag", "remote", "config",
+	"status", "diff", "log", "show",
 	"blame", "describe", "rev-parse", "ls-files", "ls-tree", "cat-file", "shortlog", "whatchanged", "grep",
 ]);
+
+/**
+ * **多态**子命令：同一子命令既能读也能写，必须看参数才能判定。
+ * 修复前把 branch/tag/remote/config 当作永远只读 —— 但
+ * `git config --global user.name x`、`git remote add`、`git tag v1`、`git branch foo`
+ * 都是**写操作**，会被误放。这是安全性问题，宁可判为询问。
+ *
+ * `readArgCount`：不带「写选项」时，额外的非选项参数个数不超过该值才算只读。
+ *   git branch          → 0 个参数 = 列分支（读）
+ *   git branch -a       → 0 个（-a 是选项）= 读
+ *   git branch foo      → 1 个 = 创建分支（写）
+ *   git config user.name      → 1 个 = 查询（读）
+ *   git config user.name foo  → 2 个 = 赋值（写）
+ */
+const GIT_POLYMORPHIC_SUBCOMMANDS: Record<string, number> = {
+	branch: 0,
+	tag: 0,
+	remote: 0,
+	config: 1,
+};
+
+/** 显式只读选项：出现即强制判定为读（即使参数个数超限）。 */
+const GIT_READ_OPTIONS = ["--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin", "--show-scope"];
 
 /** 危险命令：直接拒绝，连审批都不给（避免"手滑点批准"）。 */
 const DANGEROUS_COMMANDS = new Set([
@@ -80,6 +103,18 @@ const UNSAFE_CONSTRUCTS: Array<{ re: RegExp; reason: string }> = [
 /** 写重定向：只读判定必须失效。 */
 const WRITE_REDIRECT = /(^|[^0-9])>>?\s*[^\s>]|(^|[^0-9])>>?\s*$/;
 
+/**
+ * 白名单命令的「越权参数」：命令本身只读，但某个参数能让它执行任意操作/写文件。
+ * 命中即收回白名单、降级为询问 —— 否则白名单形同虚设（`find -exec rm` 就是任意命令执行）。
+ */
+const ALLOWLIST_ESCAPES: Array<{ re: RegExp; reason: string }> = [
+	{ re: /\bfind\b[^\n]*\s-(exec|execdir|ok|okdir|delete|fprint|fprintf|fls)\b/, reason: "find 带执行/删除/写文件动作" },
+	{ re: /\bsort\b[^\n]*\s(-o|-\-output)\b/, reason: "sort 带写文件输出" },
+	{ re: /\bdate\b[^\n]*\s(-s|--set)\b/, reason: "date 带设置系统时间" },
+	{ re: /\benv\b\s+\S+\s+\S/, reason: "env 可用于执行其他命令" },
+];
+
+
 function firstWord(segment: string): string {
 	// 跳过前置的变量赋值（FOO=bar cmd），取真正的命令名
 	const tokens = segment.trim().split(/\s+/);
@@ -105,10 +140,27 @@ function classifySegment(segment: string, cfg: Required<CommandPolicyConfig>): C
 		return { verdict: "ask", reason: "包含写重定向" };
 	}
 	if (cmd === "git") {
-		const sub = trimmed.split(/\s+/).find((t) => !t.startsWith("-") && t !== "git") ?? "";
-		return GIT_READ_ONLY_SUBCOMMANDS.has(sub)
-			? { verdict: "allow", reason: `只读：git ${sub}` }
-			: { verdict: "ask", reason: `git ${sub} 可能修改仓库` };
+		const tokens = trimmed.split(/\s+/);
+		const sub = tokens.find((t) => !t.startsWith("-") && t !== "git") ?? "";
+		if (GIT_READ_ONLY_SUBCOMMANDS.has(sub)) {
+			return { verdict: "allow", reason: `只读：git ${sub}` };
+		}
+		if (sub in GIT_POLYMORPHIC_SUBCOMMANDS) {
+			if (GIT_READ_OPTIONS.some((opt) => tokens.includes(opt))) {
+				return { verdict: "allow", reason: `只读：git ${sub}（显式只读选项）` };
+			}
+			// 统计「子命令之后」的非选项参数个数
+			const afterSub = tokens.slice(tokens.indexOf(sub) + 1).filter((t) => !t.startsWith("-"));
+			const limit = GIT_POLYMORPHIC_SUBCOMMANDS[sub]!;
+			if (afterSub.length <= limit) {
+				return { verdict: "allow", reason: `只读：git ${sub}（查询）` };
+			}
+			return { verdict: "ask", reason: `git ${sub} 带参数可写仓库配置/引用` };
+		}
+		return { verdict: "ask", reason: `git ${sub} 可能修改仓库` };
+	}
+	for (const { re, reason } of ALLOWLIST_ESCAPES) {
+		if (re.test(trimmed)) return { verdict: "ask", reason };
 	}
 	if (READ_ONLY_COMMANDS.has(cmd) || cfg.extraReadOnly.includes(cmd)) {
 		return { verdict: "allow", reason: `只读命令：${cmd}` };
