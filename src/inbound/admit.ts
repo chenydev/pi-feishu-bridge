@@ -4,7 +4,7 @@
  * - 全局 groupPolicy（mention/open/disabled/allowlist/blacklist/admin_only）
  * - 每群规则 groupRules（policy/allowlist/blacklist/requireMention 字段继承）
  * - groupPolicyByChat 向后兼容（简单 policy 覆盖）
- * - admins 群内永远放行；allow_bots 默认拒绝（none）
+ * - admins 群内只豁免策略层（@ 层默认不豁免，见 adminBypassMention）；allow_bots 默认拒绝（none）
  */
 import type { AdmitReason, BridgeConfig, FeishuInboundMessage, GroupPolicy, GroupRule } from "../types.js";
 
@@ -55,11 +55,17 @@ export function admit(
 	replyToBot: boolean,
 	lastSent: LastSentCache,
 ): { ok: true } | { ok: false; reason: AdmitReason } {
-	// 1. 自身回声/其他 bot（hermes allow_bots 默认 "none"）
-	if (msg.isBot) return { ok: false, reason: "bots_disabled" };
+	// 1. 自身回声/其他 bot（hermes allow_bots 默认 "none"）；
+	//    P2 增补：allowBots 白名单允许指定的自定义机器人/兄弟应用驱动桥（默认空 = 维持原行为）。
+	// 白名单可写 app_id（跨应用稳定）或 open_bot_id（按视角，换应用后会变）——两者都接受。
+	const allowBots = cfg.allowBots ?? [];
+	const botAllowed = msg.isBot && (allowBots.includes(msg.senderId) || (msg.senderAppId ? allowBots.includes(msg.senderAppId) : false));
+	if (msg.isBot && !botAllowed) {
+		return { ok: false, reason: "bots_disabled" };
+	}
 
 	const isGroup = msg.chatType !== "p2p";
-	const isAdmin = isGroup && cfg.admins.length > 0 && cfg.admins.includes(msg.senderId);
+	const isAdmin = isGroup && isAdminOrOwner(cfg, msg.senderId);
 
 	if (!isGroup) {
 		// DM：白名单空 = 全部放行
@@ -74,7 +80,7 @@ export function admit(
 		if (policy === "disabled") return { ok: false, reason: "group_policy_rejected" };
 		if (policy === "open") { /* 策略层放行 */ }
 		else if (policy === "admin_only") {
-			return cfg.admins.includes(msg.senderId) ? { ok: true } : { ok: false, reason: "group_policy_rejected" };
+			return isAdminOrOwner(cfg, msg.senderId) ? { ok: true } : { ok: false, reason: "group_policy_rejected" };
 		} else if (policy === "allowlist") {
 			// 群白名单（allowChats 兼容层）+ 用户白名单（rule.allowlist）
 			if (cfg.allowChats.length > 0 && !cfg.allowChats.includes(msg.chatId)) {
@@ -94,6 +100,23 @@ export function admit(
 	return checkMention(cfg, msg, mentioned, replyToBot);
 }
 
+/**
+ * 管理员或应用归属人判定（implicitAdmins 为启动时水合的 app owner/creator）。
+ * 归属人 open_id 与消息 senderId 同为「当前应用视角」，可直接比较。
+ */
+/**
+ * 有效管理员集合 = 配置的 admins + 启动时水合的应用归属人。
+ * 所有「管理员才能做」的判定都应走这里，避免换应用后 admins 视角失效。
+ */
+export function effectiveAdmins(cfg: BridgeConfig): string[] {
+	return [...new Set([...cfg.admins, ...(cfg.implicitAdmins ?? [])])];
+}
+
+export function isAdminOrOwner(cfg: BridgeConfig, senderId: string): boolean {
+	if (!senderId) return false;
+	return cfg.admins.includes(senderId) || (cfg.implicitAdmins ?? []).includes(senderId);
+}
+
 /** mention 策略检查（hermes require_mention 字段 + groupAlsoOnReply）。 */
 function checkMention(
 	cfg: BridgeConfig,
@@ -104,6 +127,8 @@ function checkMention(
 	const needMention = requireMentionForChat(cfg, msg.chatId);
 	if (!needMention) return { ok: true };
 	if (mentioned) return { ok: true };
+	// 管理员/应用归属人默认**不**豁免 @（hermes 两层模型）：需要显式 adminBypassMention=true 才免 @
+	if (cfg.adminBypassMention === true && isAdminOrOwner(cfg, msg.senderId)) return { ok: true };
 	if (cfg.groupAlsoOnReply && replyToBot) return { ok: true };
 	return { ok: false, reason: "bot_not_mentioned" };
 }

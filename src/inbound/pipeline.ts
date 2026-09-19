@@ -15,7 +15,19 @@ export interface PipelineStats {
 	batched: number;
 	dropped: number;
 	dispatched: number;
+	/** 去重标记存在但从未进入持久账本（崩溃窗口）而重新准入的条数。 */
+	recovered: number;
 	lastMessageAt?: number;
+}
+
+/** 入站接管账本：准入后立即持久化，使合并窗口内崩溃也能恢复（P0-01）。 */
+export interface IntakeLedger {
+	/** 持久化一条已准入消息；实现需保证幂等。 */
+	claim(msg: FeishuInboundMessage, conversationKey: string): void;
+	/** 该消息（或已被合入的记录）是否仍在账本中未完成。 */
+	has(id: string): boolean;
+	/** batch 合并：成员记录并入主记录。 */
+	merge(primaryId: string, memberIds: string[], merged: FeishuInboundMessage): void;
 }
 
 export interface PipelineDeps {
@@ -27,12 +39,14 @@ export interface PipelineDeps {
 	onCommand?: (msg: FeishuInboundMessage) => Promise<boolean>;
 	log?: (level: "debug" | "info" | "warn" | "error", msg: string, meta?: unknown) => void;
 	dedupeStore?: DedupeStore;
+	/** 持久接管账本（可选；不设时退化为纯内存批处理）。 */
+	intake?: IntakeLedger;
 }
 
 export class InboundPipeline {
 	private dedup: DedupeStore;
 	private batcher: TextBatcher;
-	private stats: PipelineStats = { total: 0, duplicate: 0, batched: 0, dropped: 0, dispatched: 0 };
+	private stats: PipelineStats = { total: 0, duplicate: 0, batched: 0, dropped: 0, dispatched: 0, recovered: 0 };
 	private quoteCache = new Map<string, { text: string; at: number }>();
 	private timers = new Map<string, ReturnType<typeof setTimeout>>();
 	private inFlight = new Set<Promise<void>>();
@@ -63,11 +77,20 @@ export class InboundPipeline {
 		this.stats.total += 1;
 		this.stats.lastMessageAt = Date.now();
 
-		// 1. 去重
+		// 1. 去重（P0-01：区分“已持久接管”与“仅写过标记”两种命中）
 		if (!this.dedup.check(msg.messageId)) {
-			this.stats.duplicate += 1;
-			this.deps.log?.("debug", "feishu.pipeline.drop_duplicate", { messageId: msg.messageId });
-			return;
+			if (!this.deps.intake || this.deps.intake.has(msg.messageId)) {
+				// 已进入持久账本（或未启用账本，退化旧行为）：启动恢复负责重放，重投按重复丢弃。
+				this.stats.duplicate += 1;
+				this.deps.log?.("debug", "feishu.pipeline.drop_duplicate", {
+					messageId: msg.messageId,
+					ledgered: Boolean(this.deps.intake),
+				});
+				return;
+			}
+			// orphan：账本已启用但从未接管（崩溃窗口）→ 重新准入，避免静默丢失。
+			this.stats.recovered += 1;
+			this.deps.log?.("warn", "feishu.pipeline.recover_orphan", { messageId: msg.messageId });
 		}
 
 		// 2. 每条消息先独立通过准入与引用解析，再考虑合并，避免未授权消息
@@ -82,6 +105,15 @@ export class InboundPipeline {
 		}
 
 		const key = buildConversationKey(prepared, this.deps.config);
+		// P0-01：准入通过即持久接管，消除 dedupe→ledger 之间的丢失窗口。
+		if (this.deps.intake) {
+			try {
+				this.deps.intake.claim(prepared, key);
+			} catch (error) {
+				this.dedup.forget(prepared.messageId);
+				throw error;
+			}
+		}
 		if (this.deps.onCommand) {
 			if (this.batcher.peek(key)) await this.flushBatch(key);
 			try {
@@ -134,23 +166,41 @@ export class InboundPipeline {
 		this.scheduleFlush(key);
 	}
 
-	/** batcher 窗口到期：合并 parts 后 dispatch。 */
+	/** batcher 窗口到期：合并 parts → 账本合并 → dispatch。 */
 	async flushBatch(key: string): Promise<void> {
 		this.clearFlushTimer(key);
 		const win = this.batcher.flush(key);
 		if (!win) return;
+		await this.dispatchWindow(win);
+	}
+
+	/** 把一个批处理窗口落账本（合并成员记录）后派发。 */
+	private async dispatchWindow(win: BatchWindow): Promise<void> {
 		const merged: FeishuInboundMessage = {
 			...win.carrier,
 			text: win.parts.join("\n"),
 			sourceMessageIds: win.messageIds,
 			ts: Date.now(),
 		};
+		try {
+			this.deps.intake?.merge(merged.messageId, win.messageIds, merged);
+		} catch (error) {
+			// 合并失败不阻断投递：恢复时会重放多条而不是合并态（语义降级，但不丢消息）。
+			this.deps.log?.("error", "feishu.pipeline.intake_merge_failed", {
+				messageId: merged.messageId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		await this.dispatchPrepared(merged);
 	}
 
 	private async prepareMsg(msg: FeishuInboundMessage): Promise<FeishuInboundMessage | undefined> {
 		// 3. 准入
-		const mentioned = msg.mentions.some((m) => m.isSelf) || msg.text.includes("@_all") || msg.text.includes("@all");
+		// @所有人 默认不唤醒（ignoreAtAll 默认 true）；显式关闭后与 @本 bot 等效。
+		// 注意：即使忽略 @所有人，消息里同时 @ 了本 bot 仍会命中 m.isSelf 分支。
+		const atAll = !(this.deps.config.ignoreAtAll ?? true)
+			&& (msg.text.includes("@_all") || msg.text.includes("@all"));
+		const mentioned = msg.mentions.some((m) => m.isSelf) || atAll;
 		const replyToBot = Boolean(msg.replyToMessageId && this.deps.lastSent.has(msg.replyToMessageId));
 		const verdict = admit(this.deps.config, msg, mentioned, replyToBot, this.deps.lastSent);
 		if (!verdict.ok) {
@@ -181,7 +231,12 @@ export class InboundPipeline {
 		try {
 			await this.deps.onDispatch(msg);
 		} catch (error) {
-			for (const messageId of msg.sourceMessageIds ?? [msg.messageId]) this.dedup.forget(messageId);
+			// 已持久接管的消息交给启动恢复处理（避免“重投 + 恢复”双重执行）；
+			// 未接管的消息退回去重标记，允许平台重投。
+			const ledgered = this.deps.intake?.has(msg.messageId) ?? false;
+			if (!ledgered) {
+				for (const messageId of msg.sourceMessageIds ?? [msg.messageId]) this.dedup.forget(messageId);
+			}
 			throw error;
 		}
 	}
@@ -217,9 +272,7 @@ export class InboundPipeline {
 		for (const t of this.timers.values()) clearTimeout(t);
 		this.timers.clear();
 		const pending = this.batcher.flushAll();
-		const results = await Promise.allSettled(pending.map((win) => this.dispatchPrepared({
-			...win.carrier, text: win.parts.join("\n"), sourceMessageIds: win.messageIds, ts: Date.now(),
-		})));
+		const results = await Promise.allSettled(pending.map((win) => this.dispatchWindow(win)));
 		const errors = [...inFlight, ...results]
 			.filter((result): result is PromiseRejectedResult => result.status === "rejected")
 			.map((result) => result.reason);

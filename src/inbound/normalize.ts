@@ -344,7 +344,12 @@ export function normalizeFeishuMessage(input: NormalizeInput): FeishuInboundMess
 
 	const sender = (input.sender ?? {}) as Record<string, unknown>;
 	const senderIdObj = (sender.sender_id ?? {}) as Record<string, string>;
-	const senderOpenId = senderIdObj.open_id ?? sender.open_id ?? "";
+	// 用户消息用 open_id；app/bot 消息没有 sender_id.open_id，退化到 open_bot_id 或 app_id，
+	// 以便 allowBots 白名单与自我回声过滤都能拿到稳定标识。
+	const senderOpenId = senderIdObj.open_id ?? sender.open_id
+		?? (sender.sender_type === "app" || sender.sender_type === "bot"
+			? (typeof sender.open_bot_id === "string" ? sender.open_bot_id : typeof sender.id === "string" ? sender.id : "")
+			: "");
 
 	return {
 		messageId: input.messageId,

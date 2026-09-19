@@ -2,6 +2,9 @@ import { randomUUID } from "node:crypto";
 
 export type ToolDecision = "allow" | "ask" | "deny";
 export type ApprovalChoice = "once" | "session" | "always" | "deny";
+/** 卡片终态（用于把已发出的卡片置灰）。 */
+export type ApprovalCardTerminal = "timeout" | "approved" | "denied" | "invalidated";
+
 export type ApprovalVerdict = "approved" | "denied" | "timeout";
 
 const SAFE_TOOLS = new Set(["read", "grep", "find", "ls"]);
@@ -30,7 +33,13 @@ export interface PendingApproval {
 export interface PermissionBridgeDeps {
 	getConfig: () => { autoApprove: string[]; timeoutMs: number };
 	onAsk: (pending: PendingApproval) => Promise<string | undefined>;
-	onAlwaysAllow?: (toolName: string) => void;
+	onAlwaysAllow?: (toolName: string) => boolean | void;
+	/** P0-03：run 存活探测（默认不限制；提供后旧卡在 run 结束后不得再授予权限）。 */
+	/**
+	 * 状态被非用户操作终结（超时/run 结束/关闭）时回调，用于把卡片改成不可点的终态。
+	 * 用户主动点击的路径不触发：那条路径由飞书回调用返回的 card 原地更新。
+	 */
+	onCardResolve?: (pending: PendingApproval, outcome: { resultText: string; terminal: ApprovalCardTerminal }) => void;
 	onAudit?: (event: {
 		approvalId?: string; conversationKey: string; sessionId: string; runId: string; toolCallId: string;
 		toolName: string; decision: string; paramsSummary: string; cardMessageId?: string; operatorOpenId?: string;
@@ -90,7 +99,13 @@ export class PermissionBridge {
 			if (!this.pending.has(pending.id)) return { decision, verdict };
 			pending.cardMessageId = cardMessageId;
 			if (!pending.cardMessageId) throw new Error("approval card send failed");
-		} catch {
+		} catch (error) {
+			// 卡片发送失败必须留痕：早期版本这里静默吞错，导致「审批直接被拒」无法定位。
+			this.deps.onAudit?.({
+				conversationKey: pending.conversationKey, sessionId: pending.sessionId, runId: pending.runId,
+				toolCallId: pending.toolCallId, toolName: pending.toolName, decision: "card_failed",
+				paramsSummary: error instanceof Error ? error.message : String(error),
+			});
 			this.consume(pending, "denied");
 		}
 		return { decision, verdict };
@@ -102,6 +117,21 @@ export class PermissionBridge {
 		if (this.now() > pending.expiresAt) { this.consume(pending, "timeout"); return { ok: false, reason: "审批已超时" }; }
 		if (!pending.allowedOperatorIds.includes(input.operatorOpenId)) return { ok: false, reason: "仅管理员可审批" };
 		if (input.token !== pending.token || input.messageId !== pending.cardMessageId || input.chatId !== pending.chatId) return { ok: false, reason: "审批上下文不匹配" };
+
+		// P0-03：“始终允许”必须先落盘成功才放行；落盘失败按拒绝处理，不得反馈持久授权成功。
+		if (input.choice === "always") {
+			let persisted: boolean | void = true;
+			try {
+				persisted = this.deps.onAlwaysAllow?.(pending.toolName);
+			} catch {
+				persisted = false;
+			}
+			if (persisted === false) {
+				this.consume(pending, "denied");
+				return { ok: false, reason: "授权配置写入失败，未生效" };
+			}
+		}
+
 		this.pending.delete(pending.id);
 		if (pending.timer) clearTimeout(pending.timer);
 		if (input.choice === "session") {
@@ -109,7 +139,6 @@ export class PermissionBridge {
 			allowed.add(pending.toolName);
 			this.sessionAllow.set(pending.conversationKey, allowed);
 		}
-		if (input.choice === "always") this.deps.onAlwaysAllow?.(pending.toolName);
 		const approved = input.choice !== "deny";
 		pending.resolve(approved ? "approved" : "denied");
 		this.deps.onAudit?.({
@@ -122,11 +151,52 @@ export class PermissionBridge {
 	}
 
 	resetSession(conversationKey: string): void {
-		this.sessionAllow.delete(conversationKey);
-		for (const pending of [...this.pending.values()]) {
-			if (pending.conversationKey === conversationKey) this.consume(pending, "denied");
-		}
+		this.cancelConversation(conversationKey);
 	}
+
+	/**
+	 * P0-03：按 run 失效未决审批 —— run 结束/超时/stop/被替换后，旧卡不得再授予权限。
+	 * 返回被撤销的审批数。
+	 */
+	cancelRun(conversationKey: string, runId: string): number {
+		let cancelled = 0;
+		for (const pending of [...this.pending.values()]) {
+			if (pending.conversationKey !== conversationKey || pending.runId !== runId) continue;
+			this.consume(pending, "denied");
+			cancelled += 1;
+		}
+		return cancelled;
+	}
+
+	/**
+	 * P0-03：按会话失效（/new、reset、dispose）—— 撤销该会话全部未决审批，
+	 * 并按需清空会话级授权（默认清空）。返回被撤销的审批数。
+	 */
+	cancelConversation(conversationKey: string, options: { clearSessionAllow?: boolean } = {}): number {
+		if (options.clearSessionAllow !== false) this.sessionAllow.delete(conversationKey);
+		let cancelled = 0;
+		for (const pending of [...this.pending.values()]) {
+			if (pending.conversationKey !== conversationKey) continue;
+			this.consume(pending, "denied");
+			cancelled += 1;
+		}
+		return cancelled;
+	}
+
+	/** P1-08：该会话未决审批数（有未决审批时不允许回收会话句柄）。 */
+	pendingForConversation(conversationKey: string): number {
+		let count = 0;
+		for (const pending of this.pending.values()) {
+			if (pending.conversationKey === conversationKey) count += 1;
+		}
+		return count;
+	}
+
+	/** 该会话当前的会话级授权工具集（诊断/测试用）。 */
+	sessionAllowList(conversationKey: string): string[] {
+		return [...(this.sessionAllow.get(conversationKey) ?? new Set<string>())];
+	}
+
 	pendingCount(): number { return this.pending.size; }
 
 	shutdown(): void {
@@ -140,9 +210,18 @@ export class PermissionBridge {
 	}
 
 	private consume(pending: PendingApproval, verdict: ApprovalVerdict): void {
-		this.pending.delete(pending.id);
+		if (!this.pending.delete(pending.id)) return; // 幂等：重复消耗不重复通知卡片
 		if (pending.timer) clearTimeout(pending.timer);
 		pending.resolve(verdict);
+		// 非用户点击的终结路径：把卡片改成终态并禁用按钮（否则卡片会一直看起来能点）
+		const terminal: ApprovalCardTerminal = verdict === "timeout" ? "timeout"
+			: verdict === "approved" ? "approved" : verdict === "denied" ? "denied" : "invalidated";
+		this.deps.onCardResolve?.(pending, {
+			resultText: terminal === "timeout" ? "已超时（未处理）"
+				: terminal === "approved" ? "已批准"
+				: terminal === "denied" ? "已失效" : "已失效",
+			terminal,
+		});
 		this.deps.onAudit?.({
 			approvalId: pending.id, conversationKey: pending.conversationKey, sessionId: pending.sessionId,
 			runId: pending.runId, toolCallId: pending.toolCallId, toolName: pending.toolName,

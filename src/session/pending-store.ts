@@ -14,6 +14,10 @@ export interface PendingRecord {
 	attempts: number;
 	/** auto 允许重放纯推理 turn；manual 表示已越过工具边界，重放可能重复副作用。 */
 	replayPolicy?: "auto" | "manual";
+	/** 最近一次状态变更时间（合并/刷新时更新）。 */
+	updatedAt?: number;
+	/** 本条记录覆盖的原始 sourceMessageId（batch 合并后为整个窗口）。 */
+	sourceMessageIds?: string[];
 }
 
 export class PendingStore {
@@ -42,6 +46,8 @@ export class PendingStore {
 			leaseUntil: now + this.leaseMs,
 			attempts: 1,
 			replayPolicy: "auto",
+			updatedAt: now,
+			sourceMessageIds: [message.messageId],
 		};
 		this.records.set(record.id, record);
 		try {
@@ -69,6 +75,40 @@ export class PendingStore {
 
 	ack(id: string): void {
 		if (!this.records.delete(id)) return;
+		this.persist();
+	}
+
+	/**
+	 * 是否仍有未完成的该消息记录。
+	 * 除了直接命中记录，还要覆盖“已被 batch 合入主记录”的成员 id —— 否则重投
+	 * 该成员会被误判为 orphan 而重新准入，造成重复执行。
+	 */
+	has(id: string): boolean {
+		if (this.records.has(id)) return true;
+		for (const record of this.records.values()) {
+			if (record.sourceMessageIds?.includes(id)) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * batch 合并：把同一窗口内的成员记录并入主记录，并写入合并后的消息。
+	 * 主记录不存在时不做任何事（可能已被 ack）；成员记录一律删除，避免恢复时重复重放。
+	 */
+	mergeInto(
+		primaryId: string,
+		memberIds: string[],
+		merged: Omit<FeishuInboundMessage, "raw">,
+		sourceMessageIds: string[],
+	): void {
+		const primary = this.records.get(primaryId);
+		if (!primary) return;
+		for (const id of memberIds) {
+			if (id !== primaryId) this.records.delete(id);
+		}
+		primary.message = { ...merged, raw: undefined } as Omit<FeishuInboundMessage, "raw">;
+		primary.sourceMessageIds = [...sourceMessageIds];
+		primary.updatedAt = this.now();
 		this.persist();
 	}
 

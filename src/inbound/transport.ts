@@ -427,13 +427,49 @@ export class FeishuTransport {
 	}
 
 	/** 进度消息：编辑已发消息内容（飞书 im.v1.message.update 是 PUT——PATCH 会 400）。 */
+	/**
+	 * 更新已发出的交互卡片（把按钮置灰、换成终态）。
+	 * 注意与文本区分：文本用 PUT，**卡片用 PATCH**（飞书 im.v1.message.patch）。
+	 */
+	async updateCard(messageId: string, card: unknown): Promise<boolean> {
+		try {
+			const response = (await this.client?.request({
+				url: `/open-apis/im/v1/messages/${messageId}`,
+				method: "PATCH",
+				data: { content: JSON.stringify(card) },
+			})) as { code?: number; msg?: string } | undefined;
+			if (response && typeof response.code === "number" && response.code !== 0) {
+				this.deps.log?.("warn", "feishu.transport.card_update_rejected", {
+					messageId, code: response.code, msg: response.msg,
+				});
+				return false;
+			}
+			return true;
+		} catch (err) {
+			this.deps.log?.("warn", "feishu.transport.card_update_failed", {
+				messageId, error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	}
+
 	async editMessage(messageId: string, text: string): Promise<boolean> {
 		try {
-			await this.client?.request({
+			const response = (await this.client?.request({
 				url: `/open-apis/im/v1/messages/${messageId}`,
 				method: "PUT",
 				data: { content: JSON.stringify({ text }), msg_type: "text" },
-			});
+			})) as { code?: number; msg?: string } | undefined;
+			// P0-04：Promise resolve 不等于业务成功——非 0 业务码必须按失败处理，
+			// 否则串行写入器会把“未生效的编辑”当成成功，final 交接判断随之错误。
+			if (response && typeof response.code === "number" && response.code !== 0) {
+				this.deps.log?.("warn", "feishu.transport.edit_rejected", {
+					messageId,
+					code: response.code,
+					msg: response.msg,
+				});
+				return false;
+			}
 			return true;
 		} catch (err) {
 			this.deps.log?.("warn", "feishu.transport.edit_failed", {
