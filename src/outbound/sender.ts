@@ -6,6 +6,8 @@ import { randomUUID } from "node:crypto";
 import type { BridgeConfig, SendOptions, SendResult } from "../types.js";
 import type { FeishuTransport } from "../inbound/transport.js";
 import { readVerifiedArtifact, type ValidatedArtifact } from "./artifact.js";
+import { chunkMarkdown } from "./markdown-chunks.js";
+import { isReplyFallbackCode, normalizeApiError, normalizeApiResponse } from "./api-errors.js";
 
 export const MAX_MESSAGE_LENGTH = 16_000;
 const MARKDOWN_HINT_RE = /(```|^#{1,6}\s|^\s*[-*]\s|^\s*\d+\.\s|\|.*\|)/m;
@@ -66,28 +68,21 @@ function responseSucceeded(res: unknown): res is SendResponse {
 }
 
 function errorToResult(error: unknown): SendResult {
-	const err = error as Error & { code?: number; response?: { status?: number; data?: { code?: number; msg?: string } } };
-	const code = err.response?.data?.code ?? err.response?.status ?? err.code;
-	const message = err.response?.data?.msg ?? err.message ?? String(error);
-	const retryable = code === undefined || code === 408 || code === 429 || (code >= 500 && code < 600) || /(?:timeout|network|temporar|unavailable|ECONN)/i.test(message);
-	return { success: false, error: message, retryable, errorCode: code };
+	// P0-07：统一归一化 —— 同时看 HTTP status、业务码、响应体与 Retry-After 响应头。
+	const normalized = normalizeApiError(error);
+	return {
+		success: false,
+		error: normalized.message,
+		retryable: normalized.retryable,
+		errorCode: normalized.code ?? normalized.status,
+		retryAfterMs: normalized.retryAfterMs,
+		errorClass: normalized.errorClass,
+	};
 }
 
-/** 撤回/不存在/权限等 reply 失败码 → 回退为 create（hermes _FEISHU_REPLY_FALLBACK_CODES 思路）。 */
-const REPLY_FALLBACK_CODES = new Set<number>([230003, 230004, 230005, 230007, 230008, 230018, 1001002]);
-
-/** 截断为 maxLen 字符（按 UTF-16 码元，保守处理多字节）。 */
+/** 截断为 maxLen 字符（P0-06：grapheme 边界切分 + 围栏跨片保留，不再拆坏 emoji/代码块）。 */
 export function truncateMessage(text: string, maxLen = MAX_MESSAGE_LENGTH): string[] {
-	const chunks: string[] = [];
-	let rest = text;
-	while (rest.length > maxLen) {
-		let cut = rest.lastIndexOf("\n", maxLen);
-		if (cut <= 0) cut = maxLen;
-		chunks.push(rest.slice(0, cut));
-		rest = rest.slice(cut).replace(/^\n/, "");
-	}
-	if (rest) chunks.push(rest);
-	return chunks;
+	return chunkMarkdown(text, maxLen);
 }
 
 /**
@@ -241,7 +236,7 @@ export class Sender {
 			let response = await this.rawSend(request.chatId, msgType, content, request.opts, request.uuid);
 			if (request.opts.replyTo && !responseSucceeded(response)) {
 				const code = (response as SendResponse)?.code;
-				if (code !== undefined && REPLY_FALLBACK_CODES.has(code)) {
+				if (code !== undefined && isReplyFallbackCode(code)) {
 					response = await this.rawSend(request.chatId, msgType, content, { ...request.opts, replyTo: undefined }, request.routeFallbackUuid);
 					return this.toResult(response, true);
 				}
@@ -262,11 +257,11 @@ export class Sender {
 					const edited = await this.rawEdit(opts.editMessageId, msgType, payload);
 					if (responseSucceeded(edited)) return this.toResult(edited, false, false);
 					const code = (edited as SendResponse)?.code;
-					if (code !== undefined && !REPLY_FALLBACK_CODES.has(code)) return this.toResult(edited);
+					if (code !== undefined && !isReplyFallbackCode(code)) return this.toResult(edited);
 				} catch (error) {
 					const status = (error as { response?: { status?: number; data?: { code?: number } } }).response;
 					const code = status?.data?.code ?? status?.status;
-					if (code !== 404 && (code === undefined || !REPLY_FALLBACK_CODES.has(code))) throw error;
+					if (code !== 404 && (code === undefined || !isReplyFallbackCode(code))) throw error;
 				}
 				const fallbackOpts = { ...opts, editMessageId: undefined };
 				const fallback = await this.rawSend(chatId, msgType, payload, fallbackOpts, request.routeFallbackUuid);
@@ -286,7 +281,7 @@ export class Sender {
 			// reply 失败（撤回/不存在）→ 降级 create
 			if (opts.replyTo && !responseSucceeded(res)) {
 				const code = (res as SendResponse)?.code;
-				if (code !== undefined && REPLY_FALLBACK_CODES.has(code)) {
+				if (code !== undefined && isReplyFallbackCode(code)) {
 					this.deps.log?.("warn", "feishu.sender.reply_fallback", { code, replyTo: opts.replyTo, chatId });
 					res = await this.rawSend(chatId, msgType, payload, { ...opts, replyTo: undefined }, request.routeFallbackUuid);
 					return this.toResult(res, true);
@@ -311,16 +306,19 @@ export class Sender {
 		if (responseSucceeded(res)) {
 			const messageId = (res as SendResponse)?.data?.message_id;
 			if (!messageIdRequired || (typeof messageId === "string" && messageId.length > 0)) return { success: true, messageId, fallback };
-			return { success: false, error: "0: missing message_id", fallback, retryable: true, errorCode: 0 };
+			return { success: false, error: "0: missing message_id", fallback, retryable: true, errorCode: 0, errorClass: "content_rejected" };
 		}
-		const r = res as SendResponse;
-		const code = r?.code;
-		const message = r?.msg ?? "unknown";
-		const retryable = code === undefined || code === 429 || (typeof code === "number" && code >= 500 && code < 600) || /(?:rate.?limit|too many|timeout|temporar|network|unavailable)/i.test(message);
-		const retryAfterMs = typeof r?.retry_after_ms === "number"
-			? r.retry_after_ms
-			: typeof r?.retry_after === "number" ? r.retry_after * 1_000 : undefined;
-		return { success: false, error: `${code ?? "?"}: ${message}`, fallback, retryable, errorCode: code, retryAfterMs };
+		// P0-07：非 0 业务码（HTTP 成功）也走同一套分类与 retry-after 解析。
+		const normalized = normalizeApiResponse(res);
+		return {
+			success: false,
+			error: `${normalized.code ?? "?"}: ${normalized.message}`,
+			fallback,
+			retryable: normalized.retryable,
+			errorCode: normalized.code,
+			retryAfterMs: normalized.retryAfterMs,
+			errorClass: normalized.errorClass,
+		};
 	}
 
 	private async rawSend(chatId: string, msgType: "text" | "post" | "image" | "file" | "media" | "audio", payload: string, opts: SendOptions, uuidValue: string): Promise<unknown> {
