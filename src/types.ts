@@ -85,7 +85,23 @@ export interface BridgeConfig {
 	 * - autoApprove：按工具名免审批（原有）
 	 * - adminSkipApproval：**管理员/应用归属人发起的工具调用直接放行**（默认 false）
 	 */
-	approval: { autoApprove: string[]; timeoutMs: number; adminSkipApproval?: boolean };
+	approval: {
+		autoApprove: string[];
+		timeoutMs: number;
+		adminSkipApproval?: boolean;
+		/**
+		 * 命令级审批策略：按 bash 命令语义分级，避免「每个 shell 命令都要点一次审批」。
+		 * - 只读命令（ls/cat/git status…）免审
+		 * - 危险命令（rm -rf/、fork 炸弹、curl|sh、git push --force…）直接拒绝
+		 * - 其余仍弹审批卡
+		 * 判定不确定时一律归为「询问」，宁可多问不可误放。
+		 */
+		commandPolicy?: {
+			enabled: boolean;
+			extraReadOnly?: string[];
+			extraDangerous?: string[];
+		};
+	};
 	reaction: { processingEmoji: string; enabled: boolean };
 	/**
 	 * P1-01：CardKit 流式卡片（**默认关闭**）。
@@ -146,7 +162,7 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 	adminBypassMention: false,
 	batch: { enabled: true, textWindowMs: 3000, maxMessages: 8, maxChars: 12_000 },
 	forwarding: { acceptMergeForward: true },
-	approval: { autoApprove: [], timeoutMs: 300_000, adminSkipApproval: false },
+	approval: { autoApprove: [], timeoutMs: 300_000, adminSkipApproval: false, commandPolicy: { enabled: true } },
 	reaction: { processingEmoji: "Typing", enabled: true },
 	footer: { enabled: true, showCost: true },
 	sessionLifecycle: { idleTtlMs: 30 * 60_000, maxResidentSessions: 32, sweepIntervalMs: 60_000 },

@@ -23,6 +23,7 @@ import { ResourceResolver } from "./inbound/resource-resolver.js";
 import { queueLocalFile } from "./outbound/local-file-tool.js";
 import { createBridgeInlineExtension, type BridgeGateInput } from "./session/pi-bridge-hooks.js";
 import { PermissionBridge, redactParams, type ApprovalChoice } from "./approval/permission-bridge.js";
+import { classifyCommand } from "./approval/command-policy.js";
 import { buildApprovalCard, type ApprovalCardResolution } from "./approval/cards.js";
 import {
 	ClarificationStore,
@@ -547,6 +548,25 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 				return undefined;
 			}
 		}
+
+		// 命令级策略：只读命令免审、危险命令直接拒绝，其余才弹卡。
+		// 没有这一层时 bash 只能「全审」—— 每个 ls 都要点一次审批，用户会无脑点批准，审批就失去意义。
+		if (input.toolName === "bash" && config.approval?.commandPolicy?.enabled) {
+			const command = extractBashCommand(input.paramsText);
+			if (command) {
+				const verdict = classifyCommand(command, config.approval.commandPolicy);
+				if (verdict.verdict === "allow") {
+					log.info("feishu.approval.command_allow", { reason: verdict.reason, chatId: input.chatId });
+					return undefined;
+				}
+				if (verdict.verdict === "deny") {
+					log.warn("feishu.approval.command_deny", { reason: verdict.reason, chatId: input.chatId });
+					// 直接拒绝，不弹卡：避免"手滑点批准"执行破坏性命令
+					return { block: true, reason: `该命令被安全策略拒绝：${verdict.reason}。如确需执行，请人工在宿主机操作。` };
+				}
+				log.info("feishu.approval.command_ask", { reason: verdict.reason, chatId: input.chatId });
+			}
+		}
 		const result = await permissionBridge.gate(input);
 		if (result.decision === "allow") return undefined;
 		if (result.decision === "deny") return { block: true, reason: "工具调用被策略拒绝" };
@@ -882,4 +902,14 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		clearInterval(watchdog);
 		await stopBridge();
 	});
+}
+
+/** 从脱敏后的工具参数里取出 bash 命令文本。 */
+function extractBashCommand(paramsText: string): string | undefined {
+	try {
+		const parsed = JSON.parse(paramsText) as { command?: unknown };
+		return typeof parsed?.command === "string" ? parsed.command : undefined;
+	} catch {
+		return undefined;
+	}
 }

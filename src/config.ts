@@ -97,7 +97,15 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 		// 旧版配置可能只保存 enabled/textWindowMs；逐字段合并以继承 V2 上限。
 		batch: { ...DEFAULT_CONFIG.batch, ...fileCfg.batch },
 		forwarding: { ...DEFAULT_CONFIG.forwarding, ...fileCfg.forwarding },
-		approval: { ...DEFAULT_CONFIG.approval, ...fileCfg.approval },
+		approval: {
+			...DEFAULT_CONFIG.approval,
+			...fileCfg.approval,
+			commandPolicy: {
+				enabled: fileCfg.approval?.commandPolicy?.enabled ?? DEFAULT_CONFIG.approval.commandPolicy?.enabled ?? true,
+				extraReadOnly: fileCfg.approval?.commandPolicy?.extraReadOnly ?? DEFAULT_CONFIG.approval.commandPolicy?.extraReadOnly,
+				extraDangerous: fileCfg.approval?.commandPolicy?.extraDangerous ?? DEFAULT_CONFIG.approval.commandPolicy?.extraDangerous,
+			},
+		},
 		// 开关优先级：环境变量 FEISHU_STREAMING_CARD=1/true 可强制打开（便于容器里临时实验），
 		// 否则读配置；两者都没有则用默认（关）。
 		streamingCard: {
