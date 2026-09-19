@@ -12,8 +12,15 @@ export const FEISHU_SLASH_COMMANDS: ReadonlyArray<SlashCommandHelp> = [
 	{ usage: "/queue <内容>（别名 /q）", description: "当前任务全部结束后，作为独立 turn FIFO 执行" },
 	{ usage: "/compact [说明]", description: "压缩当前会话上下文（忙碌时不可用）" },
 	{ usage: "/model [provider/model]", description: "查看或切换模型（忙碌时不可切换）" },
+	{ usage: "/models [页]", description: "列出已认证模型（provider/id，分页）" },
+	{ usage: "/thinking [等级]", description: "查看或设置当前模型的思考等级" },
+	{ usage: "/sessions [页]", description: "浏览本会话可访问的历史（含名称与最近活动）" },
+	{ usage: "/name <名称>", description: "重命名当前会话" },
+	{ usage: "/workspace [别名]", description: "查看（任何人）或切换（仅管理员）受控工作区" },
+	{ usage: "/resume <选择 id>", description: "恢复 /sessions 列出的历史会话（忙碌时不可用）" },
 	{ usage: "/feishu status", description: "查看连接、会话、队列和 outbox 状态" },
-	{ usage: "/feishu doctor", description: "运行飞书桥配置与运行环境诊断" },
+	{ usage: "/feishu doctor", description: "运行飞书桥可解释诊断（积压/错误类别/限流/待审批）" },
+	{ usage: "/feishu export", description: "管理员导出脱敏诊断包（0600，仅计数与枚举）" },
 	{ usage: "/feishu policy <策略>", description: "管理员设置当前群策略" },
 ];
 
