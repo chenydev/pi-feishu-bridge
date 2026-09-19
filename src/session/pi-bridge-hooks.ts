@@ -18,6 +18,8 @@ export interface BridgeRoute {
 	chatId: string;
 	threadId?: string;
 	sourceMessageId?: string;
+	/** 发起人 open_id（审批免审判定用；从会话活跃消息带下来，不解析 conversationKey）。 */
+	senderId?: string;
 	runId?: string;
 }
 
@@ -31,6 +33,12 @@ export interface BridgeGateInput {
 	chatId: string;
 	threadId?: string;
 	sourceMessageId?: string;
+	/**
+	 * 发起人 open_id（审批免审判定用）。
+	 * 由会话的活跃消息带下来，**不要**从 conversationKey 解析 ——
+	 * 后者只在「群聊+按人隔离」形态下含用户 ID，话题（`oc:t:th`）与私聊（裸 `oc`）都取不到。
+	 */
+	senderId?: string;
 	allowedOperatorIds: string[];
 }
 

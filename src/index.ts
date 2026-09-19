@@ -538,9 +538,10 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 	async function gateToolCall(input: BridgeGateInput): Promise<{ block?: boolean; reason?: string } | undefined> {
 		if (!permissionBridge) return undefined;
 		// 管理员/归属人免审批（approval.adminSkipApproval=true 时生效）。
-		// conversationKey 形如 `oc_xxx:u:ou_yyy`，末尾就是发起人 open_id。
+		// 必须用显式传入的 senderId：conversationKey 只在「群聊+按人隔离」形态下带用户 ID，
+		// 话题（`oc:t:th`）与私聊（裸 `oc`）都取不到，早期从 key 正则提取会漏掉这两种情况。
 		if (config.approval?.adminSkipApproval) {
-			const sender = /:u:([^:]+)$/.exec(input.conversationKey)?.[1];
+			const sender = input.senderId;
 			if (sender && effectiveAdmins(config).includes(sender)) {
 				log.info("feishu.approval.admin_skip", { toolName: input.toolName, conversationKey: input.conversationKey });
 				return undefined;
@@ -570,6 +571,7 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			chatId: route.chatId,
 			threadId: route.threadId,
 			sourceMessageId: route.sourceMessageId,
+			senderId: route.senderId,
 			allowedOperatorIds: effectiveAdmins(config),
 		});
 	});

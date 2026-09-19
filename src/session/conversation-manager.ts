@@ -149,6 +149,12 @@ interface QueuedMessage {	runId: string;
 	replyToText?: string;
 	/** 话题（thread_id）透传：hermes 话题模式。 */
 	threadId?: string;
+	/**
+	 * 发起人 open_id。审批免审判定必须用它 —— conversationKey 只在「群聊+按人隔离」
+	 * 这一种形态下才带用户 ID（话题是 `oc:t:th`、私聊是裸 `oc`），
+	 * 从 key 里正则提取会漏掉后两种，导致管理员在私聊/话题里仍需逐次审批。
+	 */
+	senderId?: string;
 	/** 处理中表情：reaction_id（add 时返回）。 */
 	reactionId?: string;
 	emojiReactionId?: string;
@@ -450,7 +456,7 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		};
 	}
 
-	routeForSessionId(sessionId: string): { conversationKey: string; chatId: string; threadId?: string; sourceMessageId?: string; runId?: string } | undefined {
+	routeForSessionId(sessionId: string): { conversationKey: string; chatId: string; threadId?: string; sourceMessageId?: string; runId?: string; senderId?: string } | undefined {
 		const session = [...this.sessions.values()].find((candidate) => candidate.sessionId === sessionId);
 		if (!session) return undefined;
 		const active = this.activeItems.get(session.conversationKey);
@@ -460,6 +466,8 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 			threadId: session.threadId,
 			sourceMessageId: active?.messageId,
 			runId: active?.runId,
+			// 审批免审判定用这个而不是解析 conversationKey（后者在私聊/话题下拿不到用户）
+			senderId: active?.senderId,
 		};
 	}
 
@@ -499,6 +507,7 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 			replyToMessageId: msg.replyToMessageId,
 			replyToText: msg.replyToText,
 			threadId: msg.threadId,
+			senderId: msg.senderId,
 		};
 		if (sess.queue.length >= MAX_QUEUE) {
 			this.deps.log?.("warn", "feishu.conv.queue_full", { chatId: key });

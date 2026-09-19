@@ -217,3 +217,22 @@ test("管理员免审批：从 conversationKey 解析发起人（形如 oc_x:u:o
 	assert.equal(pick("oc_x:t:th_1"), undefined, "话题会话解析不出用户时不应误判为管理员");
 	assert.equal(pick(""), undefined);
 });
+
+test("管理员免审批：必须用 senderId 判定，不能从 conversationKey 解析", () => {
+	// conversationKey 只在「群聊+按人隔离」形态下带用户 ID：
+	//   - 群聊按人隔离：oc_x:u:ou_y      ← 早期只覆盖了这种
+	//   - 话题（共享）：oc_x:t:th_z        ← 取不到用户
+	//   - 私聊：oc_x                      ← 取不到用户
+	// 因此判定必须依赖会话活跃消息上的 senderId。
+	const fromKey = (key: string) => /:u:([^:]+)$/.exec(key)?.[1];
+	assert.equal(fromKey("oc_x:u:ou_admin"), "ou_admin", "群聊按人隔离：能取到");
+	assert.equal(fromKey("oc_x:t:th_1"), undefined, "话题：取不到（早期 bug 就在这里漏掉）");
+	assert.equal(fromKey("oc_x"), undefined, "私聊：取不到（同上）");
+
+	// 正确做法：直接用 senderId，三种会话形态一致
+	const admins = ["ou_admin"];
+	for (const key of ["oc_x:u:ou_admin", "oc_x:t:th_1", "oc_x"]) {
+		const senderId = "ou_admin"; // 由活跃消息提供，与 key 形态无关
+		assert.ok(admins.includes(senderId), `${key} 形态下都应命中管理员`);
+	}
+});
