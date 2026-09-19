@@ -39,6 +39,9 @@ env 优先，config.json 持久化（`$HOME/feishu-bridge/config.json`，`FEISHU
 | `FEISHU_GROUP_ALSO_ON_REPLY` | groupAlsoOnReply | 回复 bot 消息免 @ |
 | `FEISHU_REQUIRE_MENTION` | requireMention | allowlist 群内是否仍需 @ |
 | `FEISHU_DEBUG` | debug | debug 日志 |
+| `FEISHU_STREAMING_CARD` | streamingCard.enabled | 流式卡片（CardKit）；explicit `0` 可强制关闭 |
+| — | adminBypassMention | 管理员/应用归属人是否毙免 @（**默认 false**：群内也需 @） |
+| — | streamingCard.throttleMs | 卡片更新节流（毫秒，默认 800） |
 
 ## 命令
 
@@ -67,7 +70,7 @@ Agent 可通过 `feishu_send_local_file` 显式回传工作区内的图片、MP4
 ```bash
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # 自动发现 tests/**/*.test.ts（当前 161 个用例）
+npm test            # 自动发现 tests/**/*.test.ts（当前 317 个用例）
 ```
 
 ## 部署（容器 dm-pi-agent）

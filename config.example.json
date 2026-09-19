@@ -3,12 +3,18 @@
   "appSecret": "replace-me",
   "domain": "feishu",
   "groupPolicy": "mention",
-  "allowChats": ["oc_test_chat_id"],
+  "allowChats": [
+    "oc_test_chat_id"
+  ],
   "allowUsers": [],
-  "admins": ["ou_admin_open_id"],
+  "admins": [
+    "ou_admin_open_id"
+  ],
+  "adminBypassMention": false,
   "groupAlsoOnReply": true,
   "groupSessionsPerUser": true,
   "requireMention": true,
+  "ignoreAtAll": true,
   "groupPolicyByChat": {
     "oc_test_chat_id": "mention"
   },
@@ -30,6 +36,21 @@
     "processingEmoji": "Typing",
     "enabled": true
   },
+  "footer": {
+    "enabled": true,
+    "showCost": true
+  },
+  "progress": {
+    "showThinking": false
+  },
+  "streamingCard": {
+    "enabled": true,
+    "throttleMs": 800
+  },
+  "workspaces": {
+    "aliases": {}
+  },
   "maxActiveSessions": 8,
-  "debug": false
+  "debug": false,
+  "allowBots": []
 }
