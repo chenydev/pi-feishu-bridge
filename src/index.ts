@@ -3,6 +3,7 @@
  * 提供 /feishu 命令与连接 supervisor（指数退避重连）。
  * 设计依据：docs/DESIGN.md §2/§3.7。
  */
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "./pi-types.js";
 import type { BridgeConfig, BridgeStatus, GroupPolicy } from "./types.js";
@@ -574,6 +575,20 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			}
 		}
 
+		// 让权给 @gotgenes/pi-permission-system：它的 tool_call 闸门在桥之前执行，
+		// deny 时桥的 handler 根本不会被调用（实测：PS 先 → 桥后，首个 block 立即返回）。
+		// 因此桥这一步只需"放行自己不再判断"，策略规则由该扩展的配置文件维护。
+		if (config.approval?.policyEngine === "pi-permission-system") {
+			if (piPermissionSystemInstalled()) {
+				return undefined;
+			}
+			// 失败关闭：扩展没装成 → 桥的审批是唯一防线，绝不能同时关掉
+			log.error("feishu.approval.policy_engine_unavailable", {
+				expected: "@gotgenes/pi-permission-system",
+				fallback: "bridge",
+			});
+		}
+
 		// 命令级策略：只读命令免审、危险命令直接拒绝，其余才弹卡。
 		// 没有这一层时 bash 只能「全审」—— 每个 ls 都要点一次审批，用户会无脑点批准，审批就失去意义。
 		if (input.toolName === "bash" && config.approval?.commandPolicy?.enabled) {
@@ -937,4 +952,24 @@ function extractBashCommand(paramsText: string): string | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * 检查 @gotgenes/pi-permission-system 是否真的装在 agent 目录里。
+ * 用途：policyEngine=pi-permission-system 时的失败关闭判定 —— 若扩展缺席，
+ * 桥的审批就是唯一防线，此时必须继续用自己的策略而不是静默放行。
+ */
+function piPermissionSystemInstalled(): boolean {
+	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(process.cwd(), "pi-agent");
+	const candidates = [
+		join(agentDir, "npm", "node_modules", "@gotgenes", "pi-permission-system"),
+		join(agentDir, "extensions", "pi-permission-system"),
+	];
+	return candidates.some((dir) => {
+		try {
+			return existsSync(join(dir, "package.json"));
+		} catch {
+			return false;
+		}
+	});
 }

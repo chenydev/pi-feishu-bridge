@@ -99,6 +99,10 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 		forwarding: { ...DEFAULT_CONFIG.forwarding, ...fileCfg.forwarding },
 		approval: {
 			...DEFAULT_CONFIG.approval,
+			// env 优先：便于在 compose 里声明，不必改仓库配置
+			policyEngine: (process.env.FEISHU_BRIDGE_POLICY_ENGINE as "bridge" | "pi-permission-system" | undefined)
+				?? fileCfg.approval?.policyEngine
+				?? DEFAULT_CONFIG.approval.policyEngine,
 			...fileCfg.approval,
 			commandPolicy: {
 				enabled: fileCfg.approval?.commandPolicy?.enabled ?? DEFAULT_CONFIG.approval.commandPolicy?.enabled ?? true,

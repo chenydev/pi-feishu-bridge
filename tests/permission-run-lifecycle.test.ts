@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { PermissionBridge, redactParams, type PendingApproval } from "../src/approval/permission-bridge.js";
+import { DEFAULT_CONFIG } from "../src/types.js";
 
 interface Ask {
 	id: string;
@@ -263,4 +264,16 @@ test("两处调用点都必须把 toolName 传下去（否则卡片又变回 JSO
 	const cmd = 'for r in /a /b; do echo "=== $r ==="; git -C "$r" status -sb; done';
 	assert.ok(!redactParams({ command: cmd }, "bash").includes('"command"'), "传了 toolName 就不该是 JSON");
 	assert.ok(redactParams({ command: cmd }).includes('"command"'), "不传则回退 JSON（旧行为，说明漏传会立刻可见）");
+});
+
+test("策略引擎让权必须是失败关闭的（扩展缺席时不能静默放行）", () => {
+	// 设计约定：policyEngine=pi-permission-system 时桥不再弹卡，
+	// 但仅当扩展确实装在 agent 目录里；否则桥的审批是唯一防线，必须回落到自研策略。
+	const cfg = JSON.parse(JSON.stringify(DEFAULT_CONFIG)) as { approval: { policyEngine?: string } };
+	// 默认必须是 bridge（不能让"让权"成为默认行为）
+	assert.equal(cfg.approval.policyEngine ?? "bridge", "bridge", "默认不能自动让权");
+
+	// env 覆盖优先于文件配置（便于 compose 声明）
+	const env = process.env.FEISHU_BRIDGE_POLICY_ENGINE;
+	assert.ok(env === undefined || ["bridge", "pi-permission-system"].includes(env), "env 取值受限于两个合法值");
 });

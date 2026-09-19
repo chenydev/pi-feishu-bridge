@@ -96,6 +96,16 @@ export interface BridgeConfig {
 		 * - 其余仍弹审批卡
 		 * 判定不确定时一律归为「询问」，宁可多问不可误放。
 		 */
+		/**
+		 * 策略引擎归属：
+		 * - "bridge"（默认）：用桥自研的 command-policy + 飞书审批卡
+		 * - "pi-permission-system"：策略完全交给 @gotgenes/pi-permission-system
+		 *   （它在 pi 的子会话里先于桥的闸门执行，deny 时桥根本收不到调用），
+		 *   桥不再弹审批卡 —— 用户用该扩展的配置文件维护放行/黑名单规则。
+		 *
+		 * **失败关闭**：若该扩展实际上没装成，桥会回落到自己的审批而非静默放行。
+		 */
+		policyEngine?: "bridge" | "pi-permission-system";
 		commandPolicy?: {
 			enabled: boolean;
 			extraReadOnly?: string[];
