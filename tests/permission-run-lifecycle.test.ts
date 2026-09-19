@@ -254,3 +254,13 @@ test("bash 审批卡显示命令本身，不是 JSON 包装", () => {
 	const secret = redactParams({ command: "curl -H 'Authorization: Bearer abc123' x" }, "bash");
 	assert.ok(!secret.includes("abc123"), "命令里的凭据仍要脱敏");
 });
+
+test("两处调用点都必须把 toolName 传下去（否则卡片又变回 JSON）", () => {
+	// 真实事故：只修了 gateToolCall 那处（src/index.ts），遗漏了
+	// pi-bridge-hooks.ts:281 的 ctx.redactParams(input.input) —— 而后者才是
+	// 工具调用事件实际渲染审批卡的路径，于是用户看到的第一张卡仍是 JSON。
+	// 这里用契约测试守住：BridgeHookContext.redactParams 必须接受并透传 toolName。
+	const cmd = 'for r in /a /b; do echo "=== $r ==="; git -C "$r" status -sb; done';
+	assert.ok(!redactParams({ command: cmd }, "bash").includes('"command"'), "传了 toolName 就不该是 JSON");
+	assert.ok(redactParams({ command: cmd }).includes('"command"'), "不传则回退 JSON（旧行为，说明漏传会立刻可见）");
+});

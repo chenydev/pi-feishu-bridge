@@ -60,7 +60,8 @@ export interface BridgeHookContext {
 	/** 审批允许的操作者（管理员集合快照）。 */
 	allowedOperatorIds(): string[];
 	/** 工具参数脱敏后的摘要。 */
-	redactParams(input: Record<string, unknown> | undefined): string;
+	/** 工具参数脱敏摘要。toolName 用于选择展示形态（bash 显示命令原文而非 JSON）。 */
+	redactParams(input: Record<string, unknown> | undefined, toolName?: string): string;
 	/**
 	 * P2-01：在当前活动会话内提出澄清问题并等待选择。
 	 * 返回选中项（answered）、超时（timeout）、取消（cancelled）或无法提问（unavailable）。
@@ -278,7 +279,7 @@ export function createBridgeInlineExtension(ctx: BridgeHookContext): InlineBridg
 				runId: route.runId ?? input.toolCallId,
 				toolCallId: input.toolCallId,
 				toolName: input.toolName,
-				paramsText: ctx.redactParams(input.input),
+				paramsText: ctx.redactParams(input.input, input.toolName),
 				chatId: route.chatId,
 				threadId: route.threadId,
 				sourceMessageId: route.sourceMessageId,
