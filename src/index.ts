@@ -10,7 +10,7 @@ import { DEFAULT_CONFIG } from "./types.js";
 import { loadConfig, resolveAppLockFile, resolvePaths, saveConfig } from "./config.js";
 import { FeishuTransport } from "./inbound/transport.js";
 import { InboundPipeline } from "./inbound/pipeline.js";
-import { LastSentCache, admit } from "./inbound/admit.js";
+import { LastSentCache, admit, effectiveAdmins } from "./inbound/admit.js";
 import { Sender } from "./outbound/sender.js";
 import { Outbox } from "./outbound/outbox.js";
 import { ConversationManager } from "./session/conversation-manager.js";
@@ -21,10 +21,18 @@ import { writeStatus } from "./runtime/status-store.js";
 import { compensateKnownChats } from "./runtime/history-compensation.js";
 import { ResourceResolver } from "./inbound/resource-resolver.js";
 import { queueLocalFile } from "./outbound/local-file-tool.js";
+import { createBridgeInlineExtension, type BridgeGateInput } from "./session/pi-bridge-hooks.js";
 import { PermissionBridge, redactParams, type ApprovalChoice } from "./approval/permission-bridge.js";
-import { buildApprovalCard, buildApprovalResultCard } from "./approval/cards.js";
+import { buildApprovalCard, type ApprovalCardResolution } from "./approval/cards.js";
+import {
+	ClarificationStore,
+	buildClarificationCard,
+	buildClarificationResultCard,
+	clarificationTextFallback,
+} from "./interaction/clarification-store.js";
 import type { CardAction } from "./inbound/transport.js";
 import { formatDoctor, runDoctor } from "./runtime/doctor.js";
+import { buildDiagnosticsBundle, writeDiagnosticsBundle } from "./runtime/diagnostics.js";
 import { buildConversationKey } from "./session/conversation-key.js";
 import { KnownChatStore } from "./runtime/known-chat-store.js";
 import { formatSlashCommandHelp } from "./slash-commands.js";
@@ -55,6 +63,8 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 	let outbox: Outbox | undefined;
 	let lastSent: LastSentCache | undefined;
 	let permissionBridge: PermissionBridge | undefined;
+	// P2-01：澄清提问（与审批完全独立，选择不授予任何工具权限）
+	let clarificationStore: ClarificationStore | undefined;
 	let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	let reconnectAttempts = 0;
 	let config: BridgeConfig = DEFAULT_CONFIG;
@@ -132,6 +142,19 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 
 	async function handleCardAction(action: CardAction): Promise<unknown> {
 		const value = action.value ?? {};
+		// P2-01：澄清选择 —— 只恢复等待点，不写任何授权
+		if (value.op === "clarify") {
+			if (typeof value.clarificationId !== "string" || typeof value.token !== "string" || typeof value.choice !== "string") return undefined;
+			const decided = clarificationStore?.decide({
+				id: value.clarificationId, token: value.token, messageId: action.messageId,
+				chatId: action.chatId ?? "", operatorOpenId: action.operatorOpenId, choice: value.choice,
+			});
+			if (!decided?.ok) return { toast: { type: "warning", content: decided?.reason ?? "该提问已失效" } };
+			return {
+				toast: { type: "success", content: decided.reason },
+				card: { type: "raw", data: buildClarificationResultCard(value.choice, action.operatorOpenId) },
+			};
+		}
 		if (value.op !== "approval" || typeof value.approvalId !== "string" || typeof value.token !== "string") return undefined;
 		const choice = value.choice;
 		if (choice !== "once" && choice !== "session" && choice !== "always" && choice !== "deny") return undefined;
@@ -140,9 +163,15 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			operatorOpenId: action.operatorOpenId, choice: choice as ApprovalChoice,
 		});
 		if (!decision?.ok) return { toast: { type: "warning", content: decision?.reason ?? "审批已失效" } };
+		// 原地更新同一张卡：保留原文与参数，标题改成结论、被选项加 ✓、其余禁用。
+		const resolution: ApprovalCardResolution = {
+			choice: choice as ApprovalChoice,
+			resultText: decision.reason,
+			operatorOpenId: action.operatorOpenId,
+		};
 		return {
 			toast: { type: "success", content: decision.reason },
-			card: { type: "raw", data: buildApprovalResultCard(decision.pending!.toolName, decision.reason) },
+			...(decision.pending ? { card: { type: "raw", data: buildApprovalCard(decision.pending, resolution) } } : {}),
 		};
 	}
 
@@ -163,11 +192,26 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		}
 		if (normalized === "/feishu" && args[0]?.toLowerCase() === "status") { reply(statusText()); return true; }
 		if (normalized === "/feishu" && args[0]?.toLowerCase() === "doctor") {
-			reply(formatDoctor(runDoctor({ config, paths: resolvePaths(homeDir), transport })));
+			reply(formatDoctor(runDoctor({ config, paths: resolvePaths(homeDir), transport, diagnostics: diagnosticsContext() })));
+			return true;
+		}
+		if (normalized === "/feishu" && args[0]?.toLowerCase() === "export") {
+			if (!effectiveAdmins(config).includes(msg.senderId)) { reply("仅管理员或应用归属人可导出诊断包"); return true; }
+			try {
+				const bundle = buildDiagnosticsBundle({
+					config, context: diagnosticsContext(),
+					checks: runDoctor({ config, paths: resolvePaths(homeDir), transport, diagnostics: diagnosticsContext() }),
+					redactPaths: [homeDir, resolvePaths(homeDir).sessionDir, process.cwd()],
+				});
+				const dir = writeDiagnosticsBundle(homeDir, bundle);
+				reply(`已导出脱敏诊断包：${dir}/（0600，仅含计数与枚举；不含密钥、正文与绝对路径）`);
+			} catch (error) {
+				reply(`诊断包导出失败：${error instanceof Error ? error.message.slice(0, 120) : "未知错误"}`);
+			}
 			return true;
 		}
 		if (normalized === "/feishu" && args[0]?.toLowerCase() === "policy") {
-			if (!config.admins.includes(msg.senderId)) { reply("仅管理员可修改群策略"); return true; }
+			if (!effectiveAdmins(config).includes(msg.senderId)) { reply("仅管理员或应用归属人可修改群策略"); return true; }
 			if (msg.chatType === "p2p") { reply("群策略只能在群聊或话题中修改"); return true; }
 			const policy = args[1] as GroupPolicy | undefined;
 			const valid: GroupPolicy[] = ["open", "mention", "disabled", "allowlist", "blacklist", "admin_only"];
@@ -183,9 +227,18 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			return true;
 		}
 		if (normalized === "/new") {
+			const force = args[0]?.toLowerCase() === "force";
+			const result = await convManager?.resetConversation(msg, { force });
+			if (!result) { reply("会话不可用"); return true; }
+			if (result.status === "error") { reply(`开新会话失败：${result.reason}`); return true; }
+			if (result.status === "busy") {
+				reply(`当前有 ${result.pending} 个任务在执行或排队。回复 /new force 可取消它们并开新会话；或先 /stop 处理当前任务。`);
+				return true;
+			}
 			permissionBridge?.resetSession(buildConversationKey(msg, config));
-			await convManager?.resetConversation(msg);
-			reply("已创建新的会话上下文");
+			reply(result.cancelled > 0
+				? `已取消 ${result.cancelled} 个排队任务，并创建新的会话上下文`
+				: "已创建新的会话上下文");
 			return true;
 		}
 		if (normalized === "/stop") {
@@ -211,6 +264,33 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		}
 		if (normalized === "/compact") { reply(await convManager?.compactConversation(msg, args.join(" ") || undefined) ?? "会话不可用"); return true; }
 		if (normalized === "/model") { reply(await convManager?.modelConversation(msg, args[0]) ?? "会话不可用"); return true; }
+		if (normalized === "/models") {
+			const page = Number.parseInt(args[0] ?? "0", 10);
+			reply(await convManager?.listModels(msg, Number.isFinite(page) ? page : 0) ?? "会话不可用");
+			return true;
+		}
+		if (normalized === "/sessions") {
+			const page = Number.parseInt(args[0] ?? "0", 10);
+			reply(await convManager?.listSessionsFor(msg, Number.isFinite(page) ? page : 0) ?? "会话不可用");
+			return true;
+		}
+		if (normalized === "/name") {
+			reply(await convManager?.renameConversation(msg, args.join(" ")) ?? "会话不可用");
+			return true;
+		}
+		if (normalized === "/resume") {
+			reply(await convManager?.resumeConversation(msg, args[0]) ?? "会话不可用");
+			return true;
+		}
+		if (normalized === "/workspace") {
+			// P2-02：查看（任何人）/ 切换（仅管理员）
+			reply(await convManager?.switchWorkspace(msg, args[0], { isAdmin: effectiveAdmins(config).includes(msg.senderId) }) ?? "会话不可用");
+			return true;
+		}
+		if (normalized === "/thinking") {
+			reply(await convManager?.thinkingConversation(msg, args[0]) ?? "会话不可用");
+			return true;
+		}
 		return false;
 	}
 
@@ -240,14 +320,38 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			onCardAction: handleCardAction,
 			log: (level, m, meta) => log[level](m, meta),
 		});
+		clarificationStore = new ClarificationStore({
+			allowedResponderIds: () => effectiveAdmins(config),
+			// 管理员名单为空时不允许任何人作答（fail closed，避免任意群成员替用户做决定）
+			onAudit: (event) => log.info("feishu.clarify.audit", event),
+		});
 		permissionBridge = new PermissionBridge({
 			getConfig: () => config.approval,
 			onAsk: async (pending) => transport!.sendCard(pending.chatId, buildApprovalCard(pending), {
 				replyTo: pending.sourceMessageId, threadId: pending.threadId,
 			}),
+			// 超时/失效（非用户点击）时把卡片改成终态并禁用按钮，
+			// 否则卡片会一直看起来可点，用户点了才被告知「审批已失效」。
+			onCardResolve: (pending, outcome) => {
+				if (!pending.cardMessageId) return;
+				const card = buildApprovalCard(pending, {
+					choice: undefined,
+					terminal: outcome.terminal,
+					resultText: outcome.resultText,
+					operatorOpenId: "",
+				});
+				void transport?.updateCard(pending.cardMessageId, card).then((ok) => {
+					if (!ok) log.warn("feishu.approval.card_terminal_failed", { approvalId: pending.id });
+				});
+			},
 			onAlwaysAllow: (toolName) => {
+				const previous = [...config.approval.autoApprove];
 				if (!config.approval.autoApprove.includes(toolName)) config.approval.autoApprove.push(toolName);
-				saveConfig(homeDir, config);
+				// P0-03：saveConfig 失败时回滚内存改动 —— 不得反馈“已持久授权”。
+				if (saveConfig(homeDir, config)) return true;
+				config.approval.autoApprove = previous;
+				log.error("feishu.approval.always_persist_failed", { toolName });
+				return false;
 			},
 			onAudit: (event) => log.info("feishu.approval.audit", event),
 		});
@@ -275,8 +379,108 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		convManager = new ConversationManager({
 			config,
 			sessionDir: paths.sessionDir,
-			sessionBackend: new PiSessionBackend({ sessionDir: paths.sessionDir, log: (l, m, x) => log[l](m, x) }),
+			// 超时策略：只在「完全没有事件产出」时中止；总时长默认不限（长任务不该被硬杀）
+			// P1-01：流式卡片复用 transport 的原始请求能力
+			rawRequest: (opts) => {
+				if (!transport) throw new Error("transport unavailable");
+				return transport.rawRequest(opts);
+			},
+			runIdleTimeoutMs: config.runIdleTimeoutMs,
+			runMaxDurationMs: config.runMaxDurationMs,
+			sessionBackend: new PiSessionBackend({
+				sessionDir: paths.sessionDir,
+				log: (l, m, x) => log[l](m, x),
+				// P0-02：给每个子会话注入桥侧 hook（审批 gate + 文件工具），共享 outer 桥状态；
+				// 同时剔除网关扩展，避免子会话重复启动飞书 WS / 创建空状态。
+				bridgeExtensionFactory: createBridgeInlineExtension({
+					routeForSessionId: (sessionId) => convManager?.routeForSessionId(sessionId),
+					markToolBoundary: (sessionId) => convManager?.markPendingToolBoundary(sessionId),
+					gateToolCall: (input) => gateToolCall(input),
+					sendLocalFile: (input) => queueLocalFile({
+						toolCallId: input.toolCallId,
+						path: input.path,
+						caption: input.caption,
+						cwd: input.cwd,
+						homeDir,
+						route: input.route,
+						outbox,
+					}),
+					// P2-03：当前会话内的主动文本通知 —— 只认活动路由，走 durable notify
+					notifyText: async (input) => {
+						const route = input.route;
+						if (!route?.chatId) return { status: "rejected" as const, detail: "没有活动会话" };
+						const opts = { replyTo: route.sourceMessageId, threadId: route.threadId };
+						const dedupeKey = `${route.conversationKey}:${input.toolCallId}:notify`;
+						if (outbox) {
+							const ids = outbox.enqueue(route.chatId, input.text, opts, {
+								dedupeKey, laneKey: route.conversationKey, kind: "notify",
+							});
+							// 同一 toolCallId 重试只入队一次（outbox 按 dedupeKey 幂等）
+							return ids.length > 0
+								? { status: "queued" as const }
+								: { status: "delivered" as const, detail: "该通知已入队" };
+						}
+						const res = await convManager?.notifyNow(route.chatId, input.text, opts, dedupeKey);
+						return res?.success
+							? { status: "delivered" as const }
+							: { status: "rejected" as const, detail: res?.error ?? "发送失败" };
+					},
+					allowedOperatorIds: () => effectiveAdmins(config),
+				// P2-01：澄清提问 —— 卡片优先后退化为文本选项，等待有界超时
+				askChoice: async (input) => {
+					if (!clarificationStore) return { status: "unavailable" as const, detail: "澄清存储未初始化" };
+					if (!input.route?.chatId) return { status: "unavailable" as const, detail: "没有活动会话" };
+					const pending = clarificationStore.create({
+						conversationKey: input.route.conversationKey, chatId: input.route.chatId, threadId: input.route.threadId,
+						runId: input.route.runId ?? input.toolCallId, toolCallId: input.toolCallId,
+						question: input.question, options: input.options,
+					});
+					// 卡片优先：发送失败（例如无卡片权限）退化为文本选项，用户回复文本时按普通消息继续
+					let cardSent = false;
+					try {
+						const messageId = await transport?.sendCard(input.route.chatId, buildClarificationCard(pending), {
+							replyTo: input.route.sourceMessageId, threadId: input.route.threadId,
+						});
+						clarificationStore.attachCard(pending.id, messageId);
+						cardSent = Boolean(messageId);
+					} catch (error) {
+						log.warn("feishu.clarify.card_failed", { error: error instanceof Error ? error.message : String(error) });
+					}
+					if (!cardSent) {
+						const fallback = clarificationTextFallback(pending);
+						if (outbox) {
+							outbox.enqueue(input.route.chatId, fallback, { replyTo: input.route.sourceMessageId, threadId: input.route.threadId }, {
+								dedupeKey: `${input.route.conversationKey}:${input.toolCallId}:clarify`, laneKey: input.route.conversationKey, kind: "notify",
+							});
+						}
+					}
+					return await pending.verdict;
+				},
+					redactParams,
+					log: (level, msg, meta) => log[level](msg, meta),
+				}),
+			}),
 			pendingFile: join(paths.sessionDir, "..", "pending.jsonl"),
+			// P0-05：会话指针持久化 —— /new 后重启仍处于新会话，不回退到旧上下文。
+			conversationFile: join(paths.sessionDir, "..", "conversations.jsonl"),
+			// P0-03：run 结束/会话重置时撤销未决审批卡（旧卡不得再授予权限）。
+			// P1-08：有未决审批的会话不允许回收句柄（避免审批卡失去响应目标）。
+			pendingApprovalCount: (conversationKey) =>
+				(permissionBridge?.pendingForConversation(conversationKey) ?? 0)
+				+ (clarificationStore?.pendingForConversation(conversationKey) ?? 0),
+			onApprovalInvalidate: ({ conversationKey, runId, reason }) => {
+				if (!permissionBridge) return;
+				const cancelled = runId
+					? permissionBridge.cancelRun(conversationKey, runId)
+					: permissionBridge.cancelConversation(conversationKey);
+				// P2-01：同一 run 的未决提问一并失效（旧卡片不得再影响新状态）
+				const clarifyCancelled = runId
+					? clarificationStore?.cancelRun(conversationKey, runId) ?? 0
+					: clarificationStore?.cancelConversation(conversationKey) ?? 0;
+				if (cancelled > 0 || clarifyCancelled > 0) {
+					log.info("feishu.approval.invalidated", { conversationKey, runId, reason, cancelled, clarifyCancelled });
+				}
+			},
 			sender,
 			durableOutbox: outbox,
 			resourceResolver: new ResourceResolver({
@@ -298,6 +502,8 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			transport,
 			lastSent,
 			dedupeStore: new DedupeStore({ file: paths.dedupeFile, capacity: config.dedupCacheSize, ttlMs: config.dedupTtlMs }),
+			// P0-01：准入通过即写 pending ledger，消除 dedupe→ledger 丢失窗口。
+			intake: convManager?.intakeLedger(),
 			onDispatch: async (msg) => { await convManager!.route(msg); },
 			onCommand: handleFeishuCommand,
 			log: (level, m, meta) => log[level](m, meta),
@@ -325,13 +531,36 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	/**
+	 * 工具调用审批（outer hook 与子会话内联扩展共用）：返回 { block, reason } 阻断执行。
+	 * P0-02：同一实现在两个位置调用，避免“组件有实现但运行时没接上”。
+	 */
+	async function gateToolCall(input: BridgeGateInput): Promise<{ block?: boolean; reason?: string } | undefined> {
+		if (!permissionBridge) return undefined;
+		// 管理员/归属人免审批（approval.adminSkipApproval=true 时生效）。
+		// conversationKey 形如 `oc_xxx:u:ou_yyy`，末尾就是发起人 open_id。
+		if (config.approval?.adminSkipApproval) {
+			const sender = /:u:([^:]+)$/.exec(input.conversationKey)?.[1];
+			if (sender && effectiveAdmins(config).includes(sender)) {
+				log.info("feishu.approval.admin_skip", { toolName: input.toolName, conversationKey: input.conversationKey });
+				return undefined;
+			}
+		}
+		const result = await permissionBridge.gate(input);
+		if (result.decision === "allow") return undefined;
+		if (result.decision === "deny") return { block: true, reason: "工具调用被策略拒绝" };
+		const verdict = await result.verdict;
+		if (verdict === "approved") return undefined;
+		return { block: true, reason: verdict === "timeout" ? "飞书审批超时，已拒绝" : "飞书审批已拒绝" };
+	}
+
 	pi.on("tool_call", async (event, ctx) => {
 		const input = event as { toolCallId?: string; toolName?: string; input?: Record<string, unknown> };
 		const sessionId = ctx.sessionManager.getSessionId();
 		const route = convManager?.routeForSessionId(sessionId);
-		if (!route || !permissionBridge || !input.toolCallId || !input.toolName) return undefined;
+		if (!route || !input.toolCallId || !input.toolName) return undefined;
 		convManager?.markPendingToolBoundary(sessionId);
-		const result = await permissionBridge.gate({
+		return gateToolCall({
 			conversationKey: route.conversationKey,
 			sessionId,
 			runId: route.runId ?? input.toolCallId,
@@ -341,13 +570,8 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			chatId: route.chatId,
 			threadId: route.threadId,
 			sourceMessageId: route.sourceMessageId,
-			allowedOperatorIds: [...config.admins],
+			allowedOperatorIds: effectiveAdmins(config),
 		});
-		if (result.decision === "allow") return undefined;
-		if (result.decision === "deny") return { block: true, reason: "工具调用被策略拒绝" };
-		const verdict = await result.verdict;
-		if (verdict === "approved") return undefined;
-		return { block: true, reason: verdict === "timeout" ? "飞书审批超时，已拒绝" : "飞书审批已拒绝" };
 	});
 
 	async function compensateMissed(outageStartedAt: number): Promise<void> {
@@ -408,6 +632,28 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			await assemble();
 			await transport!.start();
 			outbox!.start();
+			// P1-08：空闲会话回收巡检（无 active run/排队/审批且超 TTL 才回收句柄）
+			convManager?.startLifecycle();
+			// 水合应用归属人（owner/creator）作为隐式管理员：自己驱动 agent 时不必手工维护 open_id。
+			// 注意：归属人只豁免群策略层；群内 @ 仍按 adminBypassMention（默认 false）判定。
+			try {
+				const info = await transport?.rawRequest({
+					url: `/open-apis/application/v6/applications/${config.appId}`,
+					method: "GET",
+					params: { lang: "zh_cn" },
+				});
+				const app = ((info as { data?: { app?: Record<string, unknown> } })?.data?.app ?? {}) as Record<string, unknown>;
+				const ownerId = ((app.owner as { owner_id?: string } | undefined)?.owner_id)
+					?? (typeof app.creator_id === "string" ? app.creator_id : undefined);
+				config.implicitAdmins = ownerId ? [ownerId] : [];
+				log.info("feishu.config.app_owner_hydrated", { hasOwner: Boolean(ownerId), adminBypassMention: config.adminBypassMention === true });
+			} catch (error) {
+				log.warn("feishu.config.app_owner_hydrate_failed", {
+					error: error instanceof Error ? error.message : String(error),
+					hint: "缺少 application:application:readonly scope 时无法水合归属人；管理员仍按 config.admins 生效",
+				});
+				config.implicitAdmins = [];
+			}
 			setStatus("conn", "飞书桥启动中…");
 			setStatus("bridge", "飞书桥已启动");
 			log.info("bridge started", { bot: transport?.getBotIdentity() });
@@ -440,6 +686,11 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		try {
 			permissionBridge?.shutdown();
 			try { await pipeline?.stop(); } catch { /* best effort */ }
+			// P1-08：先停空闲回收巡检，避免关闭过程中回收句柄
+			convManager?.stopLifecycle();
+			// P2-01：未决提问全部失效（不假装重启后能恢复）
+			const clarifyCancelled = clarificationStore?.shutdown() ?? 0;
+			if (clarifyCancelled > 0) log.info("feishu.clarify.shutdown", { cancelled: clarifyCancelled });
 			try { await convManager?.shutdown(); } catch { /* best effort */ }
 			try { await outbox?.stop(); } catch { /* best effort */ }
 			try {
@@ -499,6 +750,21 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 
 	// ------------------------------------------------------------ 命令 ----
 
+	/** P2-04：诊断上下文（只含计数与枚举，供 doctor/导出复用）。 */
+	function diagnosticsContext() {
+		updateStatus();
+		return {
+			lastErrorClass: status.lastError ? "last_error_present" : undefined,
+			outbox: status.outbox,
+			conversations: status.conversations,
+			pendingApprovals: status.pendingApprovals ?? 0,
+			budget: convManager?.budgetSnapshot(),
+			piVersion: process.env.PI_VERSION,
+			uptimeMs: Math.round(process.uptime() * 1_000),
+			transport: { running: Boolean(transport?.isRunning()), connected: Boolean(transport?.isConnected()) },
+		};
+	}
+
 	function statusText(): string {
 		updateStatus();
 		const lines = [
@@ -513,6 +779,15 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			`策略: 全局 ${config.groupPolicy}${Object.keys(config.groupPolicyByChat).length ? `，覆盖 ${JSON.stringify(config.groupPolicyByChat)}` : ""}`,
 			`群白名单: ${config.allowChats.length ? config.allowChats.join(", ") : "（全部群按策略）"}`,
 		];
+			// P1-07：预算/熔断状态（限流冷却时显示恢复时间，明确 final 不受影响）
+			const budget = convManager?.budgetSnapshot();
+			if (budget) {
+				const live = budget.categories.live ?? { tokens: 0, rejected: 0 };
+				const notice = convManager?.budgetCooldownNotice?.();
+				lines.push(notice
+					? `限流预算: ${notice}`
+					: `限流预算: live 令牌 ${live.tokens} / 跳过 ${live.rejected} / 连续失败 ${budget.failures}`);
+			}
 			if (status.lastMessageAt) lines.push(`最近消息: ${new Date(status.lastMessageAt).toLocaleTimeString()}`);
 			if (status.lastError) lines.push(`最近错误: ${status.lastError.slice(0, 200)}`);
 		return lines.join("\n");
@@ -569,12 +844,14 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		const sessionId = (ctx as { sessionManager?: { getSessionId(): string } })?.sessionManager?.getSessionId() ?? "";
 		const ev = event as { toolName?: string; args?: unknown };
 		const toolName = ev.toolName ?? "tool";
-		convManager?.onToolEvent(sessionId, toolName, "start", (ev.args ?? {}) as Record<string, unknown>);
+		const toolCallId = typeof (ev as { toolCallId?: unknown }).toolCallId === "string" ? (ev as { toolCallId: string }).toolCallId : undefined;
+		convManager?.onToolEvent(sessionId, toolName, "start", (ev.args ?? {}) as Record<string, unknown>, toolCallId);
 	});
 	pi.on("tool_execution_end", (event, ctx) => {
 		const sessionId = (ctx as { sessionManager?: { getSessionId(): string } })?.sessionManager?.getSessionId() ?? "";
 		const toolName = (event as { toolName?: string })?.toolName ?? "tool";
-		convManager?.onToolEvent(sessionId, toolName, "end");
+		const endToolCallId = typeof (event as { toolCallId?: unknown }).toolCallId === "string" ? (event as { toolCallId: string }).toolCallId : undefined;
+		convManager?.onToolEvent(sessionId, toolName, "end", undefined, endToolCallId);
 	});
 
 	pi.on("session_start", async () => {

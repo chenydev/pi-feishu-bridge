@@ -70,14 +70,20 @@ test("disabled 策略：全部拒绝", () => {
 	assert.equal(admit(c, groupMsg(), true, false, new LastSentCache(8)).ok, false);
 });
 
-test("管理员也要 @（hermes：admin 只豁免策略层，不豁免 mention）", () => {
-	const c = cfg({ groupPolicy: "mention", admins: ["ou_admin"] });
+test("管理员默认不豁免 @（adminBypassMention 默认 false），显式开启后才豁免", () => {
 	const msg = groupMsg({ senderId: "ou_admin" });
-	assert.equal(admit(c, msg, true, false, new LastSentCache(8)).ok, true); // @ 放行
-	assert.equal(admit(c, msg, false, false, new LastSentCache(8)).ok, false); // 未 @ 拒绝
-	// admin 豁免策略层：disabled/admin_only 下 admin 放行（mention 仍查）
+	// 默认（hermes 两层模型）：管理员只豁免策略层，未 @ 仍拒绝
+	const c = cfg({ groupPolicy: "mention", admins: ["ou_admin"] });
+	assert.equal(admit(c, msg, true, false, new LastSentCache(8)).ok, true);
+	assert.equal(admit(c, msg, false, false, new LastSentCache(8)).ok, false, "默认未 @ 应拒绝");
+	// 显式开启豁免：管理员不必 @ 即可驱动 agent
+	const lax = cfg({ groupPolicy: "mention", admins: ["ou_admin"], adminBypassMention: true });
+	assert.equal(admit(lax, msg, true, false, new LastSentCache(8)).ok, true);
+	assert.equal(admit(lax, msg, false, false, new LastSentCache(8)).ok, true, "开启豁免后未 @ 也放行");
+	// admin 豁免策略层：admin_only 下 admin 过策略层，@ 层默认仍要过
 	const c2 = cfg({ groupPolicy: "admin_only", admins: ["ou_admin"] });
 	assert.equal(admit(c2, msg, true, false, new LastSentCache(8)).ok, true);
+	assert.equal(admit(c2, msg, false, false, new LastSentCache(8)).ok, false, "admin_only 下管理员未 @ 仍拒绝");
 });
 
 test("allowlist 策略：非白名单群拒绝", () => {
@@ -146,9 +152,122 @@ test("每群规则：policy/requireMention/allowlist 逐字段继承", () => {
 	const c4 = cfg({ groupPolicy: "blacklist", groupRules: { oc_x: { blacklist: ["ou_bad"] } } });
 	assert.equal(admit(c4, groupMsg({ senderId: "ou_bad", chatId: "oc_x" }), true, false, new LastSentCache(8)).ok, false);
 	assert.equal(admit(c4, groupMsg({ senderId: "ou_ok", chatId: "oc_x" }), true, false, new LastSentCache(8)).ok, true);
-	// admin_only 策略：admin 过策略层，但 mention 层仍要 @（hermes 两层模型）
+	// admin_only 策略：admin 过策略层；mention 层默认也要过 @（adminBypassMention 默认 false）
 	const c5 = cfg({ groupPolicy: "admin_only", admins: ["ou_admin"] });
 	assert.equal(admit(c5, groupMsg({ senderId: "ou_admin" }), true, false, new LastSentCache(8)).ok, true);
-	assert.equal(admit(c5, groupMsg({ senderId: "ou_admin" }), false, false, new LastSentCache(8)).ok, false);
+	assert.equal(admit(c5, groupMsg({ senderId: "ou_admin" }), false, false, new LastSentCache(8)).ok, false, "管理员默认也要 @");
+	// 显式开启豁免后才免 @
+	const c5lax = cfg({ groupPolicy: "admin_only", admins: ["ou_admin"], adminBypassMention: true });
+	assert.equal(admit(c5lax, groupMsg({ senderId: "ou_admin" }), false, false, new LastSentCache(8)).ok, true);
 	assert.equal(admit(c5, groupMsg({ senderId: "ou_user" }), true, false, new LastSentCache(8)).ok, false);
+});
+
+test("allowBots 白名单：默认拒绝所有 bot，登记后可放行指定 app", async () => {
+	const cfg = { ...DEFAULT_CONFIG, groupPolicy: "open" as const };
+	const botMsg = (senderId: string) => ({
+		messageId: "m-bot", chatId: "oc_group", chatType: "group" as const,
+		senderId, senderName: "自定义机器人", isBot: true, msgType: "text" as const,
+		text: "hi", mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "CY智能助手", isSelf: true }],
+		resources: [], raw: undefined, ts: Date.now(),
+	});
+	const lastSent = { has: () => false };
+	// 默认：拒绝
+	assert.deepEqual(admit(cfg, botMsg("cli_testbot00000000") as never, true, false, lastSent as never), { ok: false, reason: "bots_disabled" });
+	// 白名单：放行（@ 仍需满足）
+	const allowed = { ...cfg, allowBots: ["cli_testbot00000000"] };
+	assert.deepEqual(admit(allowed, botMsg("cli_testbot00000000") as never, true, false, lastSent as never), { ok: true });
+	// 白名单外：仍拒绝
+	assert.deepEqual(admit(allowed, botMsg("cli_other") as never, true, false, lastSent as never), { ok: false, reason: "bots_disabled" });
+	// 白名单但没 @（mention 策略）：按 mention 规则拒绝
+	const mentionCfg = { ...allowed, groupPolicy: "mention" as const };
+	assert.deepEqual(admit(mentionCfg, botMsg("cli_testbot00000000") as never, false, false, lastSent as never), { ok: false, reason: "bot_not_mentioned" });
+});
+
+test("@所有人 默认被过滤，可配置为不过滤（ignoreAtAll）", async () => {
+	const base = { ...DEFAULT_CONFIG, groupPolicy: "mention" as const };
+	const atAllMsg = {
+		messageId: "m-atall", chatId: "oc_group", chatType: "group" as const,
+		senderId: "ou_user", senderName: "同事", isBot: false, msgType: "text" as const,
+		text: "@_all 大家好，这是群公告", mentions: [], resources: [], raw: undefined, ts: Date.now(),
+	};
+	const lastSent = { has: () => false };
+
+	// 默认（ignoreAtAll 未设置 = true）：@所有人 不唤醒
+	assert.deepEqual(
+		admit(base, atAllMsg as never, false, false, lastSent as never),
+		{ ok: false, reason: "bot_not_mentioned" },
+		"默认必须过滤 @所有人",
+	);
+	// 显式关闭过滤：@所有人 视为已提及
+	assert.deepEqual(
+		admit({ ...base, ignoreAtAll: false }, atAllMsg as never, true, false, lastSent as never),
+		{ ok: true },
+	);
+	// 即使开启过滤，消息里同时 @ 了本 bot 仍应唤醒（isSelf 分支）
+	assert.deepEqual(
+		admit(base, atAllMsg as never, true, false, lastSent as never),
+		{ ok: true },
+		"真实 @本 bot 不受 @所有人 过滤影响",
+	);
+});
+
+test("allowBots 支持 app_id 匹配（换应用后 open_id 变化仍可用）", async () => {
+	const cfgBots = { ...DEFAULT_CONFIG, groupPolicy: "open" as const, allowBots: ["cli_testbot00000000"] };
+	const appMsg = {
+		messageId: "m-webhook", chatId: "oc_group", chatType: "group" as const,
+		senderId: "ou_new_perspective_bot", // 视角相关，换应用后会变
+		senderAppId: "cli_testbot00000000", // 稳定
+		isBot: true, msgType: "text" as const, text: "@bot hi",
+		mentions: [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "TestAssistant", isSelf: true }],
+		resources: [], raw: undefined, ts: Date.now(),
+	};
+	const lastSent = { has: () => false };
+	assert.deepEqual(
+		admit(cfgBots, appMsg as never, true, false, lastSent as never),
+		{ ok: true },
+		"仅凭 app_id 白名单就应放行（不依赖视角相关的 open_id）",
+	);
+	// 既不是白名单里的 app_id 也不是白名单里的 open_id → 拒绝
+	assert.deepEqual(
+		admit(cfgBots, { ...appMsg, senderAppId: "cli_other", senderId: "ou_other" } as never, true, false, lastSent as never),
+		{ ok: false, reason: "bots_disabled" },
+	);
+});
+
+test("管理员/应用归属人默认也要 @（adminBypassMention 默认关闭）", async () => {
+	const base = { ...DEFAULT_CONFIG, groupPolicy: "mention" as const };
+	const ownerMsg = {
+		messageId: "m-owner", chatId: "oc_group", chatType: "group" as const,
+		senderId: "ou_owner", senderName: "陈勇", isBot: false, msgType: "text" as const,
+		text: "帮我看看这个报错", mentions: [], resources: [], raw: undefined, ts: Date.now(),
+	};
+	const lastSent = { has: () => false };
+	// 归属人（启动时水合的 implicitAdmins）：默认不豁免 @
+	assert.deepEqual(
+		admit({ ...base, implicitAdmins: ["ou_owner"] } as never, ownerMsg as never, false, false, lastSent as never),
+		{ ok: false, reason: "bot_not_mentioned" },
+		"应用归属人默认也要 @",
+	);
+	// admins 配置里的管理员同理
+	assert.deepEqual(
+		admit({ ...base, admins: ["ou_owner"] } as never, ownerMsg as never, false, false, lastSent as never),
+		{ ok: false, reason: "bot_not_mentioned" },
+		"配置的管理员默认也要 @",
+	);
+	//  @ 到 bot 时管理员照常放行
+	assert.deepEqual(
+		admit({ ...base, admins: ["ou_owner"] } as never, ownerMsg as never, true, false, lastSent as never),
+		{ ok: true },
+		"管理员 @ 后应放行",
+	);
+	// 普通成员仍必须 @
+	assert.deepEqual(
+		admit(base as never, { ...ownerMsg, senderId: "ou_other" } as never, false, false, lastSent as never),
+		{ ok: false, reason: "bot_not_mentioned" },
+	);
+	// 显式开启豁免后，管理员免 @
+	assert.deepEqual(
+		admit({ ...base, implicitAdmins: ["ou_owner"], adminBypassMention: true } as never, ownerMsg as never, false, false, lastSent as never),
+		{ ok: true },
+	);
 });

@@ -11,6 +11,7 @@ function config(over: Partial<BridgeConfig> = {}): BridgeConfig {
 	return {
 		...DEFAULT_CONFIG,
 		reaction: { ...DEFAULT_CONFIG.reaction, enabled: false },
+		footer: { enabled: false, showCost: false },
 		...over,
 	};
 }
@@ -158,11 +159,11 @@ test("运行超时会 abort 并 dispose，下一条消息新建 session", async 
 		sessionDir: "/tmp/feishu-conversation-timeout",
 		sessionBackend: backend,
 		sender: sender(sent) as never,
-		runTimeoutMs: 15,
+		runIdleTimeoutMs: 15,
 	});
 
 	await manager.route(message("m-timeout"));
-	await waitUntil(() => sent.some((item) => item.text.includes("任务处理超时")));
+	await waitUntil(() => sent.some((item) => item.text.includes("没有新进展")));
 	await waitUntil(() => disposed === 1 && unsubscribed === 1);
 	await manager.route(message("m-next"));
 	await waitUntil(() => sent.some((item) => item.text === "recovered"));

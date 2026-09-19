@@ -98,7 +98,29 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 		batch: { ...DEFAULT_CONFIG.batch, ...fileCfg.batch },
 		forwarding: { ...DEFAULT_CONFIG.forwarding, ...fileCfg.forwarding },
 		approval: { ...DEFAULT_CONFIG.approval, ...fileCfg.approval },
+		// 开关优先级：环境变量 FEISHU_STREAMING_CARD=1/true 可强制打开（便于容器里临时实验），
+		// 否则读配置；两者都没有则用默认（关）。
+		streamingCard: {
+			enabled: envStreamingCardEnabled(env)
+				?? fileCfg.streamingCard?.enabled
+				?? DEFAULT_CONFIG.streamingCard?.enabled
+				?? false,
+			throttleMs: fileCfg.streamingCard?.throttleMs
+				?? DEFAULT_CONFIG.streamingCard?.throttleMs
+				?? 800,
+		},
+		runIdleTimeoutMs: fileCfg.runIdleTimeoutMs ?? DEFAULT_CONFIG.runIdleTimeoutMs,
+		runMaxDurationMs: fileCfg.runMaxDurationMs ?? DEFAULT_CONFIG.runMaxDurationMs,
+		allowBots: fileCfg.allowBots ?? DEFAULT_CONFIG.allowBots,
 		reaction: { ...DEFAULT_CONFIG.reaction, ...fileCfg.reaction },
+		footer: { ...DEFAULT_CONFIG.footer, ...fileCfg.footer },
+		sessionLifecycle: { ...DEFAULT_CONFIG.sessionLifecycle, ...fileCfg.sessionLifecycle },
+		progress: { ...DEFAULT_CONFIG.progress, ...fileCfg.progress },
+		workspaces: {
+			...DEFAULT_CONFIG.workspaces,
+			...fileCfg.workspaces,
+			aliases: { ...DEFAULT_CONFIG.workspaces?.aliases, ...fileCfg.workspaces?.aliases },
+		},
 	};
 	merged.groupPolicy = requireGroupPolicy((fileCfg as Record<string, unknown>).groupPolicy ?? merged.groupPolicy, "config.groupPolicy");
 	if (merged.defaultGroupPolicy !== undefined) merged.defaultGroupPolicy = requireGroupPolicy(merged.defaultGroupPolicy, "config.defaultGroupPolicy");
@@ -172,4 +194,14 @@ export function saveConfig(homeDir: string, cfg: BridgeConfig): boolean {
 
 export function loadJsonFile<T>(file: string): T | undefined {
 	return loadJson<T>(file);
+}
+
+/** 环境变量开关：FEISHU_STREAMING_CARD=1|true|yes 打开流式卡片；0|false|no 强制关闭；未设置返回 undefined。 */
+function envStreamingCardEnabled(env: NodeJS.ProcessEnv = process.env): boolean | undefined {
+	const raw = env.FEISHU_STREAMING_CARD;
+	if (raw === undefined || raw === "") return undefined;
+	const normalized = raw.trim().toLowerCase();
+	if (["1", "true", "yes", "on"].includes(normalized)) return true;
+	if (["0", "false", "no", "off"].includes(normalized)) return false;
+	return undefined;
 }

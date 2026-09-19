@@ -42,8 +42,35 @@ export interface BridgeConfig {
 	allowChats: string[];
 	/** DM 白名单；空 = 全部放行 */
 	allowUsers: string[];
-	/** 管理员 open_id；群内永远放行 */
+	/**
+	 * 管理员与「应用归属人」是否豁免 @ 检查（**默认 false**）。
+	 * 默认关闭时对齐 hermes 两层模型：admin 只豁免策略层，群内仍必须 @ 才触发。
+	 * 归属人由启动时调用开放平台接口水合（见 implicitAdmins），无需手工维护 open_id。
+	 */
+	adminBypassMention?: boolean;
+	/**
+	 * 运行时水合的隐式管理员（应用 owner/creator 的 open_id，当前应用视角）。
+	 * 不写入配置文件：换应用/改归属后重启自动刷新。
+	 */
+	implicitAdmins?: string[];
+	/** 管理员 open_id；豁免群策略层（@ 层由 adminBypassMention 决定） */
 	admins: string[];
+	/**
+	 * 允许触发桥的 bot/app 白名单（app_id 或 bot open_id）。
+	 * 默认空 = 拒绝所有 bot 消息（hermes allow_bots=none 的安全默认）；
+	 * 需要自定义机器人/webhook 或兄弟应用驱动时显式登记。
+	 */
+	allowBots?: string[];
+	/** run 空闲超时（无任何事件产出才算）；0 = 关闭。默认 10 分钟。 */
+	runIdleTimeoutMs?: number;
+	/** run 总时长硬上限；0 = 不限制（默认）。 */
+	runMaxDurationMs?: number;
+	/**
+	 * 是否忽略「@所有人」的唤醒（默认 true = 过滤）。
+	 * @所有人 常用于群公告类广播，默认不应唤醒 agent；
+	 * 显式设为 false 后，@所有人 与 @本 bot 等效（仍受群策略与白名单约束）。
+	 */
+	ignoreAtAll?: boolean;
 	/** mention 策略下，回复 bot 消息（parent 命中本 bot 已发缓存）免 @ */
 	groupAlsoOnReply: boolean;
 	/** 群内普通消息按用户隔离会话（hermes group_sessions_per_user 默认 true）；
@@ -53,8 +80,30 @@ export interface BridgeConfig {
 
 	batch: BatchConfig;
 	forwarding: { acceptMergeForward: boolean };
-	approval: { autoApprove: string[]; timeoutMs: number };
+	/**
+	 * 审批策略：
+	 * - autoApprove：按工具名免审批（原有）
+	 * - adminSkipApproval：**管理员/应用归属人发起的工具调用直接放行**（默认 false）
+	 */
+	approval: { autoApprove: string[]; timeoutMs: number; adminSkipApproval?: boolean };
 	reaction: { processingEmoji: string; enabled: boolean };
+	/**
+	 * P1-01：CardKit 流式卡片（**默认关闭**）。
+	 * 打开后过程内容用流式卡片呈现，最终回答仍走 durable 文本通道（卡片失败不影响交付）。
+	 * 需要应用具备 `cardkit:card:write` 权限；也可用环境变量 FEISHU_STREAMING_CARD=1 临时启用。
+	 */
+	streamingCard?: { enabled: boolean; throttleMs: number };
+	/** P1-03：final 页脚（模型/耗时/token/费用估算）。 */
+	footer: { enabled: boolean; showCost: boolean };
+	/** P1-08：空闲会话回收（与 maxActiveSessions 的“并发上限”语义不同）。 */
+	sessionLifecycle: { idleTtlMs: number; maxResidentSessions: number; sweepIntervalMs: number };
+	/** P1-02：处理中进度展示（工具名/耗时/脱敏摘要；思考摘要默认关闭）。 */
+	progress: { showThinking: boolean };
+	/**
+	 * P2-02：受控工作区别名 —— 只允许别名映射到 realpath 白名单目录。
+	 * 空对象 = 功能关闭（默认）；绝对路径/`..`/白名单外的值一律拒绝。
+	 */
+	workspaces: { aliases: Record<string, string> };
 	sessionDir: string;
 	debug: boolean;
 	/** 最近已发消息缓存容量（回复判定用） */
@@ -79,12 +128,24 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 	allowUsers: [],
 	admins: [],
 	groupAlsoOnReply: true,
+	allowBots: [],
+	// 空闲超时：只在「完全没有事件产出」时中止（对齐 hermes 不设固定总时长的做法）
+	runIdleTimeoutMs: 600_000,
+	// 总时长上限：默认 0 = 不限制
+	runMaxDurationMs: 0,
 	groupSessionsPerUser: true,
 	requireMention: true,
+	// 群内 @ 检查对所有人一致（含管理员/应用归属人）——管理员可显式设为 true 豁免
+	adminBypassMention: false,
 	batch: { enabled: true, textWindowMs: 3000, maxMessages: 8, maxChars: 12_000 },
 	forwarding: { acceptMergeForward: true },
-	approval: { autoApprove: [], timeoutMs: 300_000 },
+	approval: { autoApprove: [], timeoutMs: 300_000, adminSkipApproval: false },
 	reaction: { processingEmoji: "Typing", enabled: true },
+	footer: { enabled: true, showCost: true },
+	sessionLifecycle: { idleTtlMs: 30 * 60_000, maxResidentSessions: 32, sweepIntervalMs: 60_000 },
+	progress: { showThinking: false },
+	// P2-02：默认关闭 —— 未确定授权范围前不允许切换工作区
+	workspaces: { aliases: {} },
 	sessionDir: "sessions/feishu",
 	debug: false,
 	lastSentCacheSize: 64,
@@ -126,7 +187,12 @@ export interface FeishuInboundMessage {
 	messageId: string;
 	chatId: string;
 	chatType: "p2p" | "group" | "topic";
-	senderId: string; // open_id 优先
+	senderId: string;
+	/**
+	 * app/bot 消息的 app_id（如 cli_xxx）。app_id 跨应用稳定，
+	 * 而 open_id/open_bot_id 是按应用视角生成的，换应用后会变 —— allowBots 白名单应优先用它。
+	 */
+	senderAppId?: string; // open_id 优先
 	senderName?: string;
 	isBot: boolean;
 	msgType: InboundMsgType;
@@ -164,6 +230,8 @@ export interface SendResult {
 	retryable?: boolean;
 	errorCode?: number;
 	retryAfterMs?: number;
+	/** P0-07：统一错误分类（rate_limited/permission/not_found/...），用于日志与降级决策。 */
+	errorClass?: string;
 }
 
 export class RetryableError extends Error {}
@@ -176,6 +244,8 @@ export interface SessionBackend {
 		chatId: string;
 		conversationKey: string;
 		sessionFile?: string;
+		/** P2-02：该会话的工作目录（默认进程 cwd；绝不修改进程全局 cwd）。 */
+		cwd?: string;
 		}): Promise<{
 			sessionId: string;
 			prompt(text: string, images?: PiImageContent[]): Promise<unknown>;
@@ -187,6 +257,20 @@ export interface SessionBackend {
 			modelId: string;
 			compact?(instructions?: string): Promise<string>;
 			setModel?(modelId: string): Promise<boolean>;
+			/** P1-06：已认证模型清单（provider 用于区分同名模型）。 */
+			listModels?(): Promise<Array<{ id: string; provider?: string }>>;
+			/** P1-06：当前模型支持的思考等级（空/未实现表示不支持）。 */
+			availableThinkingLevels?(): string[];
+			/** P1-06：当前思考等级。 */
+			thinkingLevel?(): string;
+			/** P1-06：设置思考等级（由 provider 内部按模型能力 clamp）。 */
+			setThinkingLevel?(level: string): void;
+			/** P1-04：列出会话目录下的会话（仅用于归属校验后的浏览）。 */
+			listSessions?(): Promise<Array<{ path: string; id: string; name?: string; modified: number; messageCount: number }>>;
+			/** P1-04：当前会话名称。 */
+			sessionName?(): string | undefined;
+			/** P1-04：重命名当前会话（写入 Pi transcript）。 */
+			setSessionName?(name: string): void;
 		}>;
 }
 

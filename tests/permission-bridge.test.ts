@@ -30,7 +30,7 @@ test("审批：session 仅当前 conversation 生效，always 回写全局", asy
 	const bridge = new PermissionBridge({
 		getConfig: () => ({ autoApprove: [], timeoutMs: 1_000 }),
 		onAsk: async (value) => { pending = value; return `card-${value.toolCallId}`; },
-		onAlwaysAllow: (tool) => always.push(tool),
+		onAlwaysAllow: (tool) => { always.push(tool); },
 	});
 	let gate = await bridge.gate(input("session-1"));
 	bridge.decide({ id: pending.id, token: pending.token, messageId: "card-session-1", chatId: "oc", operatorOpenId: "admin", choice: "session" });

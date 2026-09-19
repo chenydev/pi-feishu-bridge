@@ -242,26 +242,38 @@ test("全链路：回复 bot 上一条消息免 @ 放行（B1 场景）", async 
 	assert.equal(dispatched.length, 1);
 });
 
-test("全链路：@_all 放行", async () => {
+test("全链路：@_all 默认被过滤（不唤醒 agent）", async () => {
 	const dispatched: FeishuInboundMessage[] = [];
 	const pipeline = new InboundPipeline({
-		config: cfg({ groupPolicy: "mention", batch: NO_BATCH }),
+		config: cfg({ groupPolicy: "mention", batch: NO_BATCH }), // ignoreAtAll 默认 true
 		transport: {} as FeishuTransport,
 		lastSent: new LastSentCache(8),
 		onDispatch: async (m) => { dispatched.push(m); },
 	});
 	await pipeline.handle(fakeMsg({ text: "@_all 大家好" }));
-	assert.equal(dispatched.length, 1);
+	assert.equal(dispatched.length, 0, "@所有人 默认必须被过滤");
 });
 
-test("全链路：占位解析后的 @all 仍按全员提及放行", async () => {
+test("全链路：ignoreAtAll=false 时 @_all 放行（可配置）", async () => {
+	const dispatched: FeishuInboundMessage[] = [];
+	const pipeline = new InboundPipeline({
+		config: cfg({ groupPolicy: "mention", batch: NO_BATCH, ignoreAtAll: false }),
+		transport: {} as FeishuTransport,
+		lastSent: new LastSentCache(8),
+		onDispatch: async (m) => { dispatched.push(m); },
+	});
+	await pipeline.handle(fakeMsg({ text: "@_all 大家好" }));
+	assert.equal(dispatched.length, 1, "显式关闭过滤后应放行");
+});
+
+test("全链路：@all 默认被过滤（占位解析后同样不唤醒）", async () => {
 	const dispatched: FeishuInboundMessage[] = [];
 	const pipeline = new InboundPipeline({
 		config: cfg({ groupPolicy: "mention", batch: NO_BATCH }), transport: {} as FeishuTransport,
 		lastSent: new LastSentCache(8), onDispatch: async (msg) => { dispatched.push(msg); },
 	});
 	await pipeline.handle(fakeMsg({ text: "@all 大家好", mentions: [] }));
-	assert.equal(dispatched.length, 1);
+	assert.equal(dispatched.length, 0, "@all 默认必须被过滤");
 });
 
 test("入站命令：显式消费且不进入 batch/Agent，未知斜杠命令仍正常 dispatch", async () => {
