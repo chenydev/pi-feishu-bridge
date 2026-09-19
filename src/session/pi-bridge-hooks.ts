@@ -87,6 +87,22 @@ export interface BridgeHookContext {
 		text: string;
 		route?: { conversationKey: string; chatId: string; threadId?: string; sourceMessageId?: string; runId?: string };
 	}): Promise<{ status: "queued" | "delivered" | "rejected"; detail?: string }>;
+	/**
+	 * 上下文压缩开始/结束的提示（P2-04 补充）。
+	 * 长会话触发压缩时 Pi 会静默暂停一段时间，用户侧只看到"莫名卡住"，
+	 * 需要显式告知；压缩失败同样要说明，否则失败后继续跑会让人摸不着头脑。
+	 */
+	notifyCompaction?(input: {
+		sessionId: string;
+		phase: "start" | "end" | "failed";
+		detail?: string;
+	}): void;
+	/**
+	 * Pi 确认本次运行彻底结束（不会再有 auto-retry / auto-compact / follow-up）。
+	 * 官方文档：agent_end 之后 Pi 仍可能继续，只有 agent_settled 是最终信号。
+	 * 用于把「本轮结束」认定得比 turn_end/agent_end 更准确。
+	 */
+	markSettled?(sessionId: string): void;
 	log?: (level: "debug" | "info" | "warn" | "error", msg: string, meta?: unknown) => void;
 }
 
@@ -209,6 +225,43 @@ export function createBridgeInlineExtension(ctx: BridgeHookContext): InlineBridg
 				}
 				return { content: [{ type: "text", text: `无法提问：${result.detail}` }], isError: true } as ExtensionToolResult;
 			},
+		});
+
+		// 上下文压缩：显式告知用户，避免"莫名卡住"
+		pi.on("session_before_compact", async (_event: unknown, runtimeCtx: ExtensionRuntimeContext) => {
+			try {
+				ctx.notifyCompaction?.({ sessionId: runtimeCtx.sessionManager.getSessionId(), phase: "start" });
+			} catch (error) {
+				ctx.log?.("warn", "feishu.bridge.compaction_hook_failed", { error: String(error) });
+			}
+		});
+		pi.on("session_compact", async (_event: unknown, runtimeCtx: ExtensionRuntimeContext) => {
+			try {
+				ctx.notifyCompaction?.({ sessionId: runtimeCtx.sessionManager.getSessionId(), phase: "end" });
+			} catch (error) {
+				ctx.log?.("warn", "feishu.bridge.compaction_hook_failed", { error: String(error) });
+			}
+		});
+		pi.on("session_compact_failed", async (event: unknown, runtimeCtx: ExtensionRuntimeContext) => {
+			try {
+				const reason = (event as { reason?: string })?.reason;
+				ctx.notifyCompaction?.({
+					sessionId: runtimeCtx.sessionManager.getSessionId(),
+					phase: "failed",
+					detail: typeof reason === "string" ? reason : undefined,
+				});
+			} catch (error) {
+				ctx.log?.("warn", "feishu.bridge.compaction_hook_failed", { error: String(error) });
+			}
+		});
+
+		// agent_settled：Pi 确认不会再有 retry/compaction/follow-up —— 比 agent_end 更终局
+		pi.on("agent_settled", async (_event: unknown, runtimeCtx: ExtensionRuntimeContext) => {
+			try {
+				ctx.markSettled?.(runtimeCtx.sessionManager.getSessionId());
+			} catch (error) {
+				ctx.log?.("warn", "feishu.bridge.settled_hook_failed", { error: String(error) });
+			}
 		});
 
 		pi.on("tool_call", async (event: unknown, runtimeCtx: ExtensionRuntimeContext) => {

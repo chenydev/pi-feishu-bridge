@@ -397,6 +397,31 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 					routeForSessionId: (sessionId) => convManager?.routeForSessionId(sessionId),
 					markToolBoundary: (sessionId) => convManager?.markPendingToolBoundary(sessionId),
 					gateToolCall: (input) => gateToolCall(input),
+					notifyCompaction: ({ sessionId, phase, detail }) => {
+						const route = convManager?.routeForSessionId(sessionId);
+						if (!route) return;
+						log.info("feishu.bridge.compaction", { phase, chatId: route.chatId });
+						// 压缩期间 Pi 不产出事件，发一条可见提示消除"莫名卡住"的困惑。
+						// 必须用 notifyNow（notify 是 private）：attempt 里带 chatId+phase 保证压缩
+						// 反复触发时不会每轮刷屏，但每次真实压缩都能出一次。
+						if (phase === "start") {
+							void convManager?.notifyNow(route.chatId, "🧠 上下文较长，正在整理记忆…", {
+								replyTo: route.sourceMessageId,
+								threadId: route.threadId,
+							}, `compaction:${route.chatId}:${route.runId ?? ""}`);
+						} else if (phase === "failed") {
+							void convManager?.notifyNow(route.chatId, `⚠️ 上下文整理失败，已继续本轮${detail ? `（${detail}）` : ""}`, {
+								replyTo: route.sourceMessageId,
+								threadId: route.threadId,
+							}, `compaction-failed:${route.chatId}:${route.runId ?? ""}`);
+						}
+					},
+					markSettled: (sessionId) => {
+						const route = convManager?.routeForSessionId(sessionId);
+						if (!route) return;
+						log.info("feishu.bridge.agent_settled", { chatId: route.chatId });
+						convManager?.markSettled(sessionId);
+					},
 					sendLocalFile: (input) => queueLocalFile({
 						toolCallId: input.toolCallId,
 						path: input.path,

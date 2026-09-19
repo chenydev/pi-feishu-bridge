@@ -158,6 +158,8 @@ interface QueuedMessage {	runId: string;
 	/** 处理中表情：reaction_id（add 时返回）。 */
 	reactionId?: string;
 	emojiReactionId?: string;
+	/** Pi 的 agent_settled 信号：本轮确实不会再继续（比 turn_end 更终局）。 */
+	settled?: boolean;
 }
 
 const MAX_QUEUE = 50;
@@ -662,6 +664,18 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 	/**
 	 * P2-03：无 durable outbox 时的直发通知（工具反馈里会标明「已投递」而非「已排队」）。
 	 */
+	/**
+	 * Pi 的 agent_settled 信号：本轮彻底结束（不会再有 retry / compaction / follow-up）。
+	 * 比 turn_end / agent_end 更准确 —— 官方文档明确 agent_end 之后 Pi 仍可能继续。
+	 * 记录到活动项上，供收尾逻辑与诊断使用。
+	 */
+	markSettled(sessionId: string): void {
+		const session = [...this.sessions.values()].find((candidate) => candidate.sessionId === sessionId);
+		if (!session) return;
+		const item = this.activeItems.get(session.conversationKey);
+		if (item) item.settled = true;
+	}
+
 	async notifyNow(chatId: string, text: string, opts: { replyTo?: string; threadId?: string }, dedupeKey: string): Promise<{ success: boolean; error?: string }> {
 		const res = await this.deps.sender.send(chatId, text, opts);
 		this.deps.log?.("info", "feishu.conv.notify_sent", { chatId, dedupeKey, success: res.success });

@@ -161,3 +161,27 @@ test("P0-02：stripGatewayExtensions 无匹配时原样返回（不复制对象�
 	const input = { extensions: [{ path: "/a/pi-lark-cli/index.ts" }] };
 	assert.equal(stripGatewayExtensions(input), input);
 });
+
+test("内联扩展注册压缩与终局事件（用户侧可见性）", () => {
+	const registered: string[] = [];
+	const fakePi = {
+		registerTool: () => {},
+		on: (name: string) => { registered.push(name); },
+	} as never;
+	const ctx = {
+		gateToolCall: async () => undefined,
+		markToolBoundary: () => {},
+		routeForSessionId: () => undefined,
+		sendLocalFile: async () => ({ ok: true }),
+		allowedOperatorIds: () => [],
+		redactParams: () => "",
+	} as never;
+	createBridgeInlineExtension(ctx)(fakePi);
+	// 压缩期间 Pi 不产出任何事件，不显式告知用户就只看到"莫名卡住"
+	assert.ok(registered.includes("session_before_compact"), "必须订阅压缩开始");
+	assert.ok(registered.includes("session_compact"), "必须订阅压缩结束");
+	assert.ok(registered.includes("session_compact_failed"), "压缩失败也要说明");
+	// agent_end 之后 Pi 可能继续 auto-retry/compact/follow-up，只有 agent_settled 是终局
+	assert.ok(registered.includes("agent_settled"), "必须订阅终局信号");
+	assert.ok(registered.includes("tool_call"), "原有的工具闸门不能丢");
+});
