@@ -79,20 +79,22 @@ const DANGEROUS_COMMANDS = new Set([
 
 /** 危险模式（正则）：命中即拒绝。 */
 const DANGEROUS_PATTERNS: Array<{ re: RegExp; reason: string }> = [
-	{ re: /\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(\/|\/\*|~|\$HOME)\b/, reason: "递归删除根目录或家目录" },
-	{ re: /\brm\s+-[a-zA-Z]*r[a-zA-Z]*f|\brm\s+-[a-zA-Z]*f[a-zA-Z]*r/, reason: "强制递归删除" },
+	// 锚定到「命令位」（行首或分隔符之后）——否则 `grep -rn 'rm -rf /' docs/` 这类
+	// 只是"文本里提到"的只读搜索也会被拒，且无法通过审批绕过。
+	{ re: /(?:^|[;&|]|\n)\s*rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(\/(?!tmp\/|var\/tmp\/)|\/\*|~|\$HOME)\b/, reason: "递归删除根目录或家目录" },
 	{ re: /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/, reason: "fork 炸弹" },
-	{ re: /\bmkfs(\.\w+)?\b/, reason: "格式化文件系统" },
-	{ re: /\bdd\b[^\n]*\bof=\/dev\//, reason: "向块设备写入" },
+	{ re: /(?:^|[;&|]|\n)\s*mkfs(\.\w+)?\b/, reason: "格式化文件系统" },
+	{ re: /(?:^|[;&|]|\n)\s*dd\b[^\n]*\bof=\/dev\//, reason: "向块设备写入" },
 	{ re: />\s*\/dev\/[sh]d[a-z]/, reason: "覆盖磁盘设备" },
-	{ re: /\bchmod\s+(-R\s+)?0?777\s+\//, reason: "把根目录权限改为 777" },
+	{ re: /(?:^|[;&|]|\n)\s*chmod\s+(-R\s+)?0?777\s+\//, reason: "把根目录权限改为 777" },
 	{ re: /\b(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba|z|d)?sh\b/, reason: "下载内容直接管道给 shell 执行" },
 	{ re: /\bgit\s+push\b[^\n]*(--force\b|(?<!-)-f\b)/, reason: "强制推送（可能覆盖远端历史）" },
 	{ re: /\bgit\s+(reset\s+--hard|clean\s+-[a-zA-Z]*[fdx])/, reason: "丢弃本地改动" },
 ];
 
 /** 复合结构：出现即要求逐段判定；无法安全拆分时降级为 ask。 */
-const COMPOUND_SEPARATOR = /\s*(?:&&|\|\||;|\|)\s*/;
+// P1 修复：原正则不含 `&` 与换行，导致 `ls & git push`、多行脚本的第二行之后完全不判 → 放行任意命令
+const COMPOUND_SEPARATOR = /\s*(?:&&|\|\||;|\||&|\r?\n)\s*/;
 /** 这些构造让静态判定不可靠：命令替换、进程替换、后台执行、eval 类。 */
 const UNSAFE_CONSTRUCTS: Array<{ re: RegExp; reason: string }> = [
 	{ re: /\$\(|`/, reason: "包含命令替换，内容无法静态判定" },
@@ -101,7 +103,12 @@ const UNSAFE_CONSTRUCTS: Array<{ re: RegExp; reason: string }> = [
 	{ re: /\beval\b|\bexec\b|\bsource\b|^\s*\.\s/, reason: "动态执行" },
 ];
 /** 写重定向：只读判定必须失效。 */
-const WRITE_REDIRECT = /(^|[^0-9])>>?\s*[^\s>]|(^|[^0-9])>>?\s*$/;
+// P4 修复：原正则要求 `>` 前不是数字，于是 `2>/etc/x`、`1>&2` 全部漏判。
+// 改为先剔除无副作用 fd 复制（2>&1 / 1>&2 / >&2），再看还有没有 `>`。
+const FD_DUP = /[0-9]*>&[0-9-]+/g;
+function hasWriteRedirect(text: string): boolean {
+	return />/.test(text.replace(FD_DUP, ""));
+}
 
 /**
  * 白名单命令的「越权参数」：命令本身只读，但某个参数能让它执行任意操作/写文件。
@@ -112,6 +119,17 @@ const ALLOWLIST_ESCAPES: Array<{ re: RegExp; reason: string }> = [
 	{ re: /\bsort\b[^\n]*\s(-o|-\-output)\b/, reason: "sort 带写文件输出" },
 	{ re: /\bdate\b[^\n]*\s(-s|--set)\b/, reason: "date 带设置系统时间" },
 	{ re: /\benv\b\s+\S+\s+\S/, reason: "env 可用于执行其他命令" },
+	// P2 修复：白名单里还有这些命令，带特定参数即可执行任意命令/写任意文件
+	{ re: /\bfd\b[^\n]*\s(-x|--exec|-X|--exec-batch)\b/, reason: "fd 带执行动作" },
+	{ re: /\brg\b[^\n]*\s--pre\b/, reason: "rg 带 --pre 执行器" },
+	{ re: /\btree\b[^\n]*\s(-o|--output)\b/, reason: "tree 带输出文件" },
+	{ re: /\buniq\b\s+\S+\s+\S+\s*$/, reason: "uniq 第二参数会写文件" },
+	{ re: /\bhostname\b\s+\S/, reason: "hostname 带参数会改主机名" },
+	{ re: /\byq\b[^\n]*\s(-i|--inplace)\b/, reason: "yq 原地改写文件" },
+	// P3 修复：git 的越权参数（git 分支提前 return，此前完全绕过本表）
+	{ re: /\bgit\s+(diff|show|log|grep)\b[^\n]*\s--output\b/, reason: "git 写输出文件" },
+	{ re: /\bgit\s+grep\b[^\n]*\s-O\b/, reason: "git grep 指定 pager 可执行命令" },
+	{ re: /\bgit\s+config\b[^\n]*\s(--unset|--unset-all|--add|--replace-all|--edit|--remove-section|--rename-section)\b/, reason: "git config 写操作" },
 ];
 
 
@@ -134,10 +152,26 @@ function classifySegment(segment: string, cfg: Required<CommandPolicyConfig>): C
 	const cmd = firstWord(trimmed);
 	if (!cmd) return { verdict: "ask", reason: "无法识别命令名" };
 	if (DANGEROUS_COMMANDS.has(cmd) || cfg.extraDangerous.includes(cmd)) {
+		// P6：限定在 /tmp、/var/tmp 或相对路径（= 工作目录内）的删除降为「询问」。
+		// Agent 需要清理自己产生的临时文件，一刀切 deny 会让它无法收尾；
+		// 宿主环境的同类策略同样显式允许 /tmp。系统路径仍保持 deny。
+		if (cmd === "rm") {
+			const args = trimmed.split(/\s+/).slice(1).filter((t) => !t.startsWith("-"));
+			// `~`/`$HOME`/`$VAR` 开头的"相对"路径不算工作目录内 —— 它们展开后是家目录或未知位置
+			const safePaths = args.length > 0 && args.every((path) =>
+				path.startsWith("/tmp/") || path.startsWith("/var/tmp/")
+				|| (!path.startsWith("/") && !path.startsWith("~") && !path.startsWith("$")));
+			if (safePaths) return { verdict: "ask", reason: "删除临时/工作目录内的文件" };
+		}
 		return { verdict: "deny", reason: `危险命令：${cmd}` };
 	}
-	if (WRITE_REDIRECT.test(trimmed)) {
+	if (hasWriteRedirect(trimmed)) {
 		return { verdict: "ask", reason: "包含写重定向" };
+	}
+	// P3 修复：越权参数检查必须在 git 分支之前 —— 否则 git 的 --output/-O/--unset 等
+	// 会在下一行提前 return，永远走不到 ALLOWLIST_ESCAPES。
+	for (const { re, reason } of ALLOWLIST_ESCAPES) {
+		if (re.test(trimmed)) return { verdict: "ask", reason };
 	}
 	if (cmd === "git") {
 		const tokens = trimmed.split(/\s+/);
@@ -158,9 +192,6 @@ function classifySegment(segment: string, cfg: Required<CommandPolicyConfig>): C
 			return { verdict: "ask", reason: `git ${sub} 带参数可写仓库配置/引用` };
 		}
 		return { verdict: "ask", reason: `git ${sub} 可能修改仓库` };
-	}
-	for (const { re, reason } of ALLOWLIST_ESCAPES) {
-		if (re.test(trimmed)) return { verdict: "ask", reason };
 	}
 	if (READ_ONLY_COMMANDS.has(cmd) || cfg.extraReadOnly.includes(cmd)) {
 		return { verdict: "allow", reason: `只读命令：${cmd}` };
@@ -185,15 +216,22 @@ export function classifyCommand(
 	const raw = command.trim();
 	if (!raw) return { verdict: "ask", reason: "空命令" };
 
-	for (const { re, reason } of DANGEROUS_PATTERNS) {
-		if (re.test(raw)) return { verdict: "deny", reason };
+	// fork 炸弹无论在什么位置出现都是灾难，保留整串预检
+	if (/:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/.test(raw)) {
+		return { verdict: "deny", reason: "fork 炸弹" };
+	}
+	// 「下载内容直接管道给 shell 执行」：分段后会丢失管道语义，必须在整串上判
+	if (/\b(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba|z|d)?sh\b/.test(raw)) {
+		return { verdict: "deny", reason: "下载内容直接管道给 shell 执行" };
 	}
 	for (const { re, reason } of UNSAFE_CONSTRUCTS) {
 		if (re.test(raw)) return { verdict: "ask", reason };
 	}
 
 	// 复合命令：每一段都必须 allow，整体才 allow；任一段 deny，整体 deny。
-	const segments = raw.split(COMPOUND_SEPARATOR).filter((s) => s.trim().length > 0);
+	// 注意：先剔除 fd 复制（`2>&1`），否则其中的 `&` 会被 COMPOUND_SEPARATOR 当成分隔符，
+	// 拆出 `>1` 这样的假段并误判为「未知命令 → 询问」（实测 `ls 2>&1` 曾因此被拦）。
+	const segments = raw.replace(FD_DUP, " ").split(COMPOUND_SEPARATOR).filter((s) => s.trim().length > 0);
 	// 用分隔符还原失败（例如引号内含分号）时保守处理：段数异常则走 ask
 	if (segments.length === 0) return { verdict: "ask", reason: "无法拆分命令" };
 	let sawAsk: string | undefined;
