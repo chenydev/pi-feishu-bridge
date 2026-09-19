@@ -236,3 +236,29 @@ test("写入必须串行：并发的 update 不会重叠发出（并发会让飞
 	assert.equal(maxConcurrent, 1, `同卡片写入不得并发，实测最大并发 ${maxConcurrent}`);
 	assert.deepEqual(order, ["a", "ab", "abc"], "写入必须按调用顺序落地");
 });
+
+test("打字机参数：streaming_config 必须显式指定，且默认值不是平台的 1字/70ms", async () => {
+	const { calls, request } = recorder();
+	const card = new StreamingCard({ rawRequest: request, throttleMs: 0, now: () => 0 });
+	await card.start({ chatId: "oc_x" });
+	const payload = JSON.parse(String((calls[0]!.data as { data: string }).data));
+	const cfg = payload.config.streaming_config;
+	assert.ok(cfg, "必须显式传 streaming_config —— 平台默认 1字/70ms 会让 500 字播 35 秒");
+	assert.ok(cfg.print_step.default >= 10, `print_step 应显著大于平台默认 1，实测 ${cfg.print_step.default}`);
+	assert.ok(cfg.print_frequency_ms.default <= 70, "上屏间隔不应大于平台默认 70ms");
+	assert.ok(cfg.print_step.pc !== undefined, "应同时提供 pc 分端值");
+	assert.equal(cfg.print_strategy, "fast");
+});
+
+test("收尾文本优先：更短的 final 不会被更长的 pending 覆盖", async () => {
+	const { calls, request } = recorder();
+	const card = new StreamingCard({ rawRequest: request, throttleMs: 0, now: Date.now });
+	await card.start({ chatId: "oc_x" });
+	// 模拟"累积了很长的中间内容，但最终答案更短"（多工具轮场景）
+	card.update("中间过程的很长很长的一段内容".repeat(20));
+	card.update("最终答案很短");
+	await card.finish("最终答案很短");
+	const updates = calls.filter((c) => c.url.includes("/elements/stream/content"));
+	const last = updates.at(-1)!.data as { content: string };
+	assert.equal(last.content, "最终答案很短", "final 必须原样落地，不能被更长的 pending 顶掉");
+});

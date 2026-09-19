@@ -1392,6 +1392,8 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 					rawRequest: (opts) => { const rr = this.deps.rawRequest; if (!rr) throw new Error("rawRequest unavailable"); return rr(opts); },
 					log: (level, message, meta) => this.deps.log?.(level, message, meta),
 					throttleMs: this.deps.config.streamingCard?.throttleMs,
+					printFrequencyMs: this.deps.config.streamingCard?.printFrequencyMs,
+					printStep: this.deps.config.streamingCard?.printStep,
 				});
 				const started = await streamCard.start({
 					chatId: sess.chatId,

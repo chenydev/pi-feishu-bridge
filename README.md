@@ -94,6 +94,7 @@ env 优先，`config.json` 持久化（路径 `$FEISHU_BRIDGE_HOME/feishu-bridge
 | `FEISHU_GROUP_POLICY` | `groupPolicy` | 群策略默认值 |
 | `FEISHU_ALLOW_CHATS` / `FEISHU_ALLOW_USERS` / `FEISHU_ADMINS` | 同名字段 | csv |
 | `FEISHU_STREAMING_CARD` | `streamingCard.enabled` | `1` 打开流式卡片（默认关） |
+| — | `streamingCard.printFrequencyMs` / `printStep` | 打字机节奏：每 N 毫秒上屏 M 字。**平台默认 1字/70ms（500 字要播 35 秒）**，推荐 3字/20ms（150 字/秒） |
 | — | `approval.adminSkipApproval` | 管理员/归属人免审批（默认 `false`） |
 | — | `adminBypassMention` | 管理员是否豁免 @（默认 `false`） |
 | — | `runIdleTimeoutMs` | 空闲超时（默认 10 分钟）；`runMaxDurationMs` 默认 `0` 不限制总时长 |
@@ -162,9 +163,10 @@ npm run typecheck
 
 ## 已知问题
 
-- **CardKit 流式卡片在桌面客户端有逐字动画**：同一个 `streaming_mode` 卡片，移动端立即显示全文，桌面端逐字播放。这是客户端渲染行为，服务端无法控制 —— 因此卡片模式默认关闭，默认走文本流式（两端都立即显示）。
+- **打字机速度必须显式配置**：平台默认是「每次 1 字、间隔 70ms」，500 字要播 35 秒 —— 现象是「服务端早已推完、桌面端还在慢慢吐」。必须传 `streaming_config.print_step` / `print_frequency_ms`（本桥默认 3字/20ms）。
 - **卡片写入不能并发**：并发会让 `sequence` 乱序，飞书侧最终渲染为空白卡片。写入保持严格串行。
-- **`streaming_mode` 不可置 `false`**：该参数是「动态更新能力」开关而非动效开关，置 `false` 后卡片会永远停在初始文案。
+- **`streaming_mode` 不可置 `false`**：置 `false` 后 `/content` 接口不可用（卡片会停在初始文案）。注意它只影响该接口 —— 整组件替换（`PUT /cards/{id}/elements/{eid}`）仍然可用。
+- **`partial_strategy` 字段不存在**：`/content` 的请求契约只有 `uuid` / `content` / `sequence`。
 
 ---
 

@@ -107,7 +107,13 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 				?? false,
 			throttleMs: fileCfg.streamingCard?.throttleMs
 				?? DEFAULT_CONFIG.streamingCard?.throttleMs
-				?? 800,
+				?? 1000,
+			printFrequencyMs: fileCfg.streamingCard?.printFrequencyMs
+				?? DEFAULT_CONFIG.streamingCard?.printFrequencyMs
+				?? 50,
+			printStep: fileCfg.streamingCard?.printStep
+				?? DEFAULT_CONFIG.streamingCard?.printStep
+				?? 50,
 		},
 		runIdleTimeoutMs: fileCfg.runIdleTimeoutMs ?? DEFAULT_CONFIG.runIdleTimeoutMs,
 		runMaxDurationMs: fileCfg.runMaxDurationMs ?? DEFAULT_CONFIG.runMaxDurationMs,

@@ -92,7 +92,14 @@ export interface BridgeConfig {
 	 * 打开后过程内容用流式卡片呈现，最终回答仍走 durable 文本通道（卡片失败不影响交付）。
 	 * 需要应用具备 `cardkit:card:write` 权限；也可用环境变量 FEISHU_STREAMING_CARD=1 临时启用。
 	 */
-	streamingCard?: { enabled: boolean; throttleMs: number };
+	streamingCard?: {
+		enabled: boolean;
+		throttleMs: number;
+		/** 打字机参数：每次上屏间隔（毫秒）。平台默认 70，越小越快。 */
+		printFrequencyMs?: number;
+		/** 打字机参数：每次上屏字符数。平台默认 1（500 字要播 35 秒），实测 50 可显著加速。 */
+		printStep?: number;
+	};
 	/** P1-03：final 页脚（模型/耗时/token/费用估算）。 */
 	footer: { enabled: boolean; showCost: boolean };
 	/** P1-08：空闲会话回收（与 maxActiveSessions 的“并发上限”语义不同）。 */

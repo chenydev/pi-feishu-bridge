@@ -23,6 +23,9 @@ export interface StreamingCardDeps {
 	log?: (level: "debug" | "info" | "warn" | "error", message: string, meta?: Record<string, unknown>) => void;
 	/** 更新节流（毫秒），默认 800。 */
 	throttleMs?: number;
+	/** 打字机参数（分端字段的 common 值）；默认 50ms / 50 字，见 streaming_config 注释。 */
+	printFrequencyMs?: number;
+	printStep?: number;
 	/** 单次发送的文本上限，超出截断（避免卡片体积过大）。 */
 	maxChars?: number;
 	now?: () => number;
@@ -43,6 +46,8 @@ export class StreamingCard {
 	private pendingText?: string;
 	private lastFlushAt = 0;
 	private broken = false;
+	/** 收尾阶段：此时 doWrite 不再用 pendingText 覆盖传入的最终文本。 */
+	private finalizing = false;
 	/** 写入串行链：保证同一卡片上的 PUT 不会并发。 */
 	/** 写入链：保证同一卡片的 PUT 严格顺序（并发会导致空白卡片）。 */
 	private writeChain: Promise<void> = Promise.resolve();
@@ -51,6 +56,8 @@ export class StreamingCard {
 	private writeCount = 0;
 	private finished = false;
 	private readonly throttleMs: number;
+	private readonly printFrequencyMs: number;
+	private readonly printStep: number;
 	private readonly maxChars: number;
 	private readonly now: () => number;
 	private readonly startedAt: number;
@@ -59,7 +66,9 @@ export class StreamingCard {
 		// 默认 200ms：实测飞书 CardKit 在 200ms 间隔下连续 8 次更新全部落地
 		// （真正限制吞吐的是 HTTP 往返，不是平台频率），因此这个值可以按体感调。
 		// 显式传入时按传入值走 —— 调用方（config/测试）知道自己要什么。
-		this.throttleMs = Math.max(0, deps.throttleMs ?? 100);
+		this.throttleMs = Math.max(0, deps.throttleMs ?? 1000);
+		this.printFrequencyMs = Math.max(1, deps.printFrequencyMs ?? 50);
+		this.printStep = Math.max(1, deps.printStep ?? 50);
 		this.maxChars = Math.max(200, deps.maxChars ?? 8_000);
 		this.now = deps.now ?? Date.now;
 		this.startedAt = this.now();
@@ -138,6 +147,10 @@ export class StreamingCard {
 	async finish(finalText: string): Promise<boolean> {
 		if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
 		if (!this.available) { this.finished = true; return false; }
+		// 标记收尾：后续写入以传入文本为准，不再合并 pendingText
+		this.finalizing = true;
+		this.pendingText = undefined;
+		if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
 		// writeChain 保证最终内容一定排在所有在途写入之后落地
 		const ok = await this.flushText(finalText);
 		this.finished = true;
@@ -193,9 +206,13 @@ export class StreamingCard {
 
 	private async doWrite(text: string): Promise<boolean> {
 		if (!this.cardId || this.broken) return false;
-		// 排队期间用户又产出了新内容：直接用最新的，中间态没有发送价值（每次推的都是全量）
-		const latest = this.pendingText ?? text;
-		if (latest.length > text.length) text = latest;
+		// 排队期间又产出了新内容：中间态没有发送价值，直接推最新的全量文本。
+		// 但**最终写入必须优先** —— 多工具轮场景下 final 可能比累积的 pendingText 更短，
+		// 按「更长」选会把旧的中间内容当成最终答案发出去。
+		if (!this.finalizing) {
+			const latest = this.pendingText ?? text;
+			if (latest.length > text.length) text = latest;
+		}
 		const writeStart = this.now();
 		try {
 			this.sequence += 1;
@@ -233,7 +250,18 @@ export class StreamingCard {
 	private cardJson(text: string): unknown {
 		return {
 			schema: "2.0",
-			config: { streaming_mode: true },   // 必须为 true：否则元素的动态更新不生效（实测卡片会一直停在初始文案）
+			config: {
+				// 必须为 true：否则 /content 接口不可用（元素内容更新会停在初始文案）
+				streaming_mode: true,
+				// 打字机速度必须显式指定 —— 平台默认是「每次 1 字 / 间隔 70ms」，
+				// 500 字要播 35 秒，这正是"服务端早已推完、PC 端还在慢慢吐"的原因。
+				// 分端字段：default 为必填，pc 单独覆盖（移动端与桌面端默认行为不同）。
+				streaming_config: {
+					print_frequency_ms: { default: this.printFrequencyMs, pc: this.printFrequencyMs },
+					print_step: { default: this.printStep, pc: this.printStep },
+					print_strategy: "fast",
+				},
+			},
 			body: {
 				elements: [
 					{ tag: "markdown", element_id: STREAM_ELEMENT_ID, content: text },
