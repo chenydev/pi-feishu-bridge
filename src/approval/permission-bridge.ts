@@ -47,14 +47,27 @@ export interface PermissionBridgeDeps {
 	now?: () => number;
 }
 
-export function redactParams(value: unknown): string {
-	const serialized = JSON.stringify(value ?? {}, (key, child) =>
-		/(?:token|secret|password|authorization|api[_-]?key)/i.test(key) ? "***" : child,
+export function redactParams(value: unknown, toolName?: string): string {
+	const scrub = (text: string) =>
+		text
+			.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1***")
+			.replace(/((?:token|secret|password|authorization|api[_-]?key)\s*[=:]\s*)[^\s"']+/gi, "$1***");
+
+	// bash：人要看的是命令本身，不是 `{"command":"..."}` 这层 JSON 包装。
+	// 而且 JSON 里换行会被转义成 \n，卡片上挤成一行后被截断 —— 审批时根本看不清在批什么。
+	if (toolName === "bash") {
+		const command = (value as { command?: unknown } | undefined)?.command;
+		if (typeof command === "string" && command.trim()) {
+			return scrub(command).slice(0, 1500);
+		}
+	}
+
+	const serialized = scrub(
+		JSON.stringify(value ?? {}, (key, child) =>
+			/(?:token|secret|password|authorization|api[_-]?key)/i.test(key) ? "***" : child,
+		),
 	);
-	return serialized
-		.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1***")
-		.replace(/((?:token|secret|password|authorization|api[_-]?key)\s*[=:]\s*)[^\s"']+/gi, "$1***")
-		.slice(0, 800);
+	return serialized.slice(0, 800);
 }
 
 export function classifyToolCall(toolName: string, autoApprove: string[], sessionAllow: Set<string>): ToolDecision {

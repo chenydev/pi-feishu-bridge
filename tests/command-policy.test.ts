@@ -166,3 +166,12 @@ test("P6 删除临时文件降为询问，系统路径仍拒绝，家目录不�
 	assert.equal(v("rm -rf $HOME"), "deny");
 	assert.equal(v("rm -rf /etc/nginx"), "deny", "系统路径");
 });
+
+test("cd 免审（Agent 常用 cd 前缀，且后续命令仍独立判定）", () => {
+	assert.equal(v("cd /workspace"), "allow");
+	assert.equal(v("cd /workspace && git status"), "allow", "截图里的实际命令形态");
+	assert.equal(v("cd .. && ls"), "allow");
+	// cd 不能成为走私通道：后面接危险/写命令照样拦
+	assert.equal(v("cd /tmp && rm -rf /"), "deny");
+	assert.equal(v("cd /workspace && npm install"), "ask");
+});

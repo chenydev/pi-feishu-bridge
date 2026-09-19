@@ -612,7 +612,7 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			runId: route.runId ?? input.toolCallId,
 			toolCallId: input.toolCallId,
 			toolName: input.toolName,
-			paramsText: redactParams(input.input),
+			paramsText: redactParams(input.input, input.toolName),
 			chatId: route.chatId,
 			threadId: route.threadId,
 			sourceMessageId: route.sourceMessageId,

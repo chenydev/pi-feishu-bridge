@@ -37,6 +37,9 @@ const READ_ONLY_COMMANDS = new Set([
 	"grep", "rg", "egrep", "fgrep", "ag", "ack",
 	"find", "fd", "locate", "which", "whereis", "type", "file", "stat", "du", "df",
 	"echo", "printf", "true", "false", "test", "[",
+	// `cd` 只切换目录、不修改任何东西（Agent 常写 `cd /workspace && git status`）。
+	// 后续命令仍按各自命令名独立判定，所以放行 cd 不会让危险命令漏网。
+	"cd",
 	"git", "jq", "yq", "tree", "basename", "dirname", "realpath", "readlink", "env", "printenv",
 ]);
 

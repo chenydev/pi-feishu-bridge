@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { PermissionBridge, type PendingApproval } from "../src/approval/permission-bridge.js";
+import { PermissionBridge, redactParams, type PendingApproval } from "../src/approval/permission-bridge.js";
 
 interface Ask {
 	id: string;
@@ -235,4 +235,22 @@ test("管理员免审批：必须用 senderId 判定，不能从 conversationKey
 		const senderId = "ou_admin"; // 由活跃消息提供，与 key 形态无关
 		assert.ok(admins.includes(senderId), `${key} 形态下都应命中管理员`);
 	}
+});
+
+test("bash 审批卡显示命令本身，不是 JSON 包装", () => {
+	// 截图问题：卡片上显示 `{"command":"cd /workspace && ls -a && echo \"--- ...`，
+	// JSON 换行被转义成 \n 后挤成一行并被截断，审批时看不清在批什么。
+	const multi = "cd /workspace && ls -a && echo hello\nls /workspace/pi-agent";
+	const shown = redactParams({ command: multi }, "bash");
+	assert.ok(!shown.includes('"command"'), `不应显示 JSON 包装，实际：${shown.slice(0, 60)}`);
+	assert.ok(shown.includes("\n"), "换行必须保留（多行命令要能看出结构）");
+	assert.ok(shown.includes("cd /workspace && ls -a"), "命令内容原样可见");
+
+	// 非 bash 工具仍走 JSON（结构化参数对其更合适）
+	const read = redactParams({ path: "/etc/hosts" }, "read");
+	assert.ok(read.includes('"path"'), "read 仍显示 JSON");
+
+	// 脱敏不能因为走了新分支而失效
+	const secret = redactParams({ command: "curl -H 'Authorization: Bearer abc123' x" }, "bash");
+	assert.ok(!secret.includes("abc123"), "命令里的凭据仍要脱敏");
 });
