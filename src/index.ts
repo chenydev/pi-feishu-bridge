@@ -8,7 +8,7 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "./pi-types.js";
 import type { BridgeConfig, BridgeStatus, GroupPolicy } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
-import { loadConfig, resolveAppLockFile, resolvePaths, saveConfig } from "./config.js";
+import { loadConfig, resolveAppLockFile, resolvePaths, saveConfig, formatTimeInZone } from "./config.js";
 import { FeishuTransport } from "./inbound/transport.js";
 import { InboundPipeline } from "./inbound/pipeline.js";
 import { LastSentCache, admit, effectiveAdmins } from "./inbound/admit.js";
@@ -24,8 +24,18 @@ import { ResourceResolver } from "./inbound/resource-resolver.js";
 import { queueLocalFile } from "./outbound/local-file-tool.js";
 import { createBridgeInlineExtension, type BridgeGateInput } from "./session/pi-bridge-hooks.js";
 import { PermissionBridge, redactParams, type ApprovalChoice } from "./approval/permission-bridge.js";
+import { AlwaysApprovedStore } from "./approval/always-approved-store.js";
+import {
+	PS_FORWARDING_PARENT_ENV_KEYS,
+	PS_FORWARDING_UPSTREAM_TIMEOUT_MS,
+	PsForwardingServer,
+	applyPsForwardingParentEnv,
+	psForwardingRootDir,
+	resolvePsForwardingConfig,
+} from "./approval/ps-forwarding.js";
 import { classifyCommand } from "./approval/command-policy.js";
 import { buildApprovalCard, type ApprovalCardResolution } from "./approval/cards.js";
+import { buildModelsCard, buildModelsCardResolved } from "./commands/models-card.js";
 import {
 	ClarificationStore,
 	buildClarificationCard,
@@ -65,6 +75,13 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 	let outbox: Outbox | undefined;
 	let lastSent: LastSentCache | undefined;
 	let permissionBridge: PermissionBridge | undefined;
+	// pi-permission-system 父会话转发（实验性，默认关）：桥充当应答方，把 PS 的 ask 变成审批卡。
+	let psForwarding: PsForwardingServer | undefined;
+	/** 「始终批准」规则表（转发路径）；未启用时为 undefined。 */
+	let alwaysApproved: AlwaysApprovedStore | undefined;
+	let psForwardingParentId: string | undefined;
+	/** 本进程自己声明过的父会话 id（撤回时只删自己设的值，不动外层 spawner 的声明）。 */
+	let psForwardingOwnEnvId: string | undefined;
 	// P2-01：澄清提问（与审批完全独立，选择不授予任何工具权限）
 	let clarificationStore: ClarificationStore | undefined;
 	let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -144,6 +161,26 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 
 	async function handleCardAction(action: CardAction): Promise<unknown> {
 		const value = action.value ?? {};
+		// 模型卡片：翻页（原地重渲染同一张卡）
+		if (value.op === "models") {
+			if (typeof value.page !== "number" || typeof value.conversationKey !== "string") return undefined;
+			const data = await convManager?.modelsCardDataByKey(value.conversationKey);
+			if (!data) return { toast: { type: "warning", content: "该会话已失效，请重新发送 /models" } };
+			return { card: { type: "raw", data: buildModelsCard({ ...data, page: value.page }) } };
+		}
+		// 模型卡片：切换（只信 id/provider，执行前仍按会话归属校验）
+		if (value.op === "models.pick") {
+			if (typeof value.id !== "string" || typeof value.conversationKey !== "string") return undefined;
+			const target = typeof value.provider === "string" ? `${value.provider}/${value.id}` : value.id;
+			const result = await convManager?.setModelByKey(value.conversationKey, target);
+			if (!result) return { toast: { type: "warning", content: "无法切换：会话不存在或正在执行任务" } };
+			if (!result.ok) return { toast: { type: "warning", content: result.reason } };
+			const data = result.data;
+			return {
+				toast: { type: "success", content: `已切换到 ${target}` },
+				card: { type: "raw", data: buildModelsCardResolved({ ...data, page: 0 }, target, true, "") },
+			};
+		}
 		// P2-01：澄清选择 —— 只恢复等待点，不写任何授权
 		if (value.op === "clarify") {
 			if (typeof value.clarificationId !== "string" || typeof value.token !== "string" || typeof value.choice !== "string") return undefined;
@@ -228,6 +265,27 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			}
 			return true;
 		}
+		if (normalized === "/feishu" && args[0]?.toLowerCase() === "always") {
+			// 「始终批准」是持久放行：必须能看、能撤，否则一次点击等于永久挖掉一块闸门。
+			if (!effectiveAdmins(config).includes(msg.senderId)) { reply("仅管理员或应用归属人可查看或撤销「始终批准」规则"); return true; }
+			if (!alwaysApproved) { reply("「始终批准」未启用（需要 pi-permission-system 转发模式）"); return true; }
+			if (args[1]?.toLowerCase() === "revoke") {
+				const pattern = args.slice(2).join(" ").trim();
+				if (!pattern) { reply("用法：/feishu always revoke <规则名>（规则名见 /feishu always）"); return true; }
+				const removed = alwaysApproved.remove(pattern);
+				log.info("feishu.approval.always_revoked", { pattern, removed, operator: msg.senderId });
+				reply(removed ? `已撤销规则「${pattern}」—— 下次同类请求会重新弹卡。` : `没有找到规则「${pattern}」。`);
+				return true;
+			}
+			const rules = alwaysApproved.list();
+			if (rules.length === 0) { reply("当前没有「始终批准」的规则（所有 ask 都会弹卡）。"); return true; }
+			const lines = rules.map((rule) => {
+				const when = formatTimeInZone(rule.approvedAt, config.timezone);
+				return `· ${rule.pattern}（${when}${rule.approvedBy ? ` · ${rule.approvedBy}` : ""}）`;
+			});
+			reply([`「始终批准」规则共 ${rules.length} 条：`, ...lines, "用 /feishu always revoke <规则名> 撤销。"].join("\n"));
+			return true;
+		}
 		if (normalized === "/new") {
 			const force = args[0]?.toLowerCase() === "force";
 			const result = await convManager?.resetConversation(msg, { force });
@@ -268,7 +326,17 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		if (normalized === "/model") { reply(await convManager?.modelConversation(msg, args[0]) ?? "会话不可用"); return true; }
 		if (normalized === "/models") {
 			const page = Number.parseInt(args[0] ?? "0", 10);
-			reply(await convManager?.listModels(msg, Number.isFinite(page) ? page : 0) ?? "会话不可用");
+			const requested = Number.isFinite(page) ? page : 0;
+			// 卡片：可原地翻页 + 点击切换模型。取不到数据时回退文本分页（保证可用性）。
+			const data = await convManager?.modelsCardData(msg);
+			if (data && transport) {
+				await transport.sendCard(msg.chatId, buildModelsCard({ ...data, page: requested }), {
+					replyTo: msg.messageId,
+					threadId: msg.threadId,
+				});
+				return true;
+			}
+			reply(await convManager?.listModels(msg, requested) ?? "会话不可用");
 			return true;
 		}
 		if (normalized === "/sessions") {
@@ -559,6 +627,106 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 	});
 
 	/**
+	 * PS 父会话转发的配置视图（父会话 id 缺省时用固定值；引擎不是 PS 时视为关闭）。
+	 */
+	function psForwardingConfigured(): { enabled: boolean; parentSessionId: string; blockedBy?: "policyEngine" } {
+		return resolvePsForwardingConfig(config.approval);
+	}
+
+	/**
+	 * 声明/撤回「本进程是 PS 的父会话」（见 PS_FORWARDING_PARENT_ENV_KEYS）。
+	 *
+	 * 变量是进程级的（桥与子会话同进程，无法只给子会话设），而效果恰好是我们想要的：
+	 * 进程内所有会话的 ask 都转发给桥；真正的发起会话从请求文件的 requesterSessionId 读。
+	 * PS 在每次工具调用时实时读环境变量，因此这里在会话创建前设置即可。
+	 *
+	 * 关闭时必须撤回自己的声明：否则 PS 会把 ask 转发到一个没人收的收件箱，
+	 * 子会话要等满 10 分钟才判拒绝（而正确行为是回落到它自己的判定）。
+	 */
+	function syncPsForwardingEnv(): void {
+		const { enabled, parentSessionId, blockedBy } = psForwardingConfigured();
+		if (blockedBy) {
+			// 开关开了但引擎不是 PS：开启转发只会让同一次调用弹两张卡，这里明确说明。
+			log.warn("feishu.approval.ps_forwarding_inactive", {
+				reason: "approval.forwarding 仅在 approval.policyEngine=pi-permission-system 时生效",
+				policyEngine: config.approval?.policyEngine ?? "bridge",
+			});
+		}
+		const installed = piPermissionSystemInstalled();
+		const active = enabled && installed;
+		if (enabled && !installed) {
+			// 与 policyEngine 同一套失败关闭语义：没装成就不做父子声明。
+			log.error("feishu.approval.ps_forwarding_unavailable", { expected: "@gotgenes/pi-permission-system" });
+		}
+		const before = psForwardingOwnEnvId;
+		const result = applyPsForwardingParentEnv({ enabled: active, parentSessionId, previousApplied: before });
+		psForwardingOwnEnvId = result.appliedValue;
+		if (result.appliedValue !== before) {
+			log.info("feishu.approval.ps_forwarding_env", {
+				state: result.appliedValue ? "declared" : "withdrawn",
+				keys: PS_FORWARDING_PARENT_ENV_KEYS,
+				parentSessionId,
+			});
+		}
+		if (result.overridden.length > 0) {
+			// 外层 spawner 已经声明过别的父会话：我们接管了它。写一条日志，免得排障时想不到。
+			log.warn("feishu.approval.ps_forwarding_env_overridden", { overridden: result.overridden, parentSessionId });
+		}
+	}
+
+	/**
+	 * 起停转发应答方。幂等：已起且父会话 id 未变则不动；id 变了则重建
+	 * （心跳与收件箱目录都挂在 id 上，不能混用）。
+	 *
+	 * 何时只能起：必须等 transport/outbox 起来（弹卡要能发出去）且 PermissionBridge 已就位。
+	 */
+	async function syncPsForwardingServer(): Promise<void> {
+		const { enabled, parentSessionId } = psForwardingConfigured();
+		if (!enabled || !piPermissionSystemInstalled() || !permissionBridge) {
+			if (psForwarding) {
+				await psForwarding.stop();
+				psForwarding = undefined;
+				psForwardingParentId = undefined;
+			}
+			return;
+		}
+		if (psForwarding && psForwardingParentId === parentSessionId) {
+			psForwarding.start();
+			return;
+		}
+		if (psForwarding) {
+			await psForwarding.stop();
+			psForwarding = undefined;
+		}
+		// 「始终批准」规则表：开启时审批卡多一个 always 按钮，命中规则的请求直接放行。
+		// 每轮同步都重建（配置可能被 /feishu policy 之类改过），成本是一次小文件读。
+		alwaysApproved = config.approval.forwarding?.alwaysApprove === false
+			? undefined
+			: new AlwaysApprovedStore({ file: resolvePaths(homeDir).alwaysApprovedFile });
+		psForwarding = new PsForwardingServer({
+			forwardingDir: psForwardingRootDir(resolveAgentDir()),
+			parentSessionId,
+			alwaysApproved,
+			routeForSessionId: (sessionId) => convManager?.routeForSessionId(sessionId),
+			allowedOperatorIds: () => effectiveAdmins(config),
+			requestDecision: async (input) => {
+				const result = await permissionBridge!.requestExternal(input, {
+					// 审批卡等待上限沿用 approval.timeoutMs；但不得越过 PS 自己的转发总超时，
+					// 否则我们会在对方已经放弃后才写响应（子会话拿不到，白留一个孤儿文件）。
+					timeoutMs: Math.min(config.approval.timeoutMs, PS_FORWARDING_UPSTREAM_TIMEOUT_MS - 30_000),
+					auditDecision: "ps_forwarding_ask",
+				});
+				// operatorId 一并带回：转发路径的「始终批准」要记下是谁放行的。
+				return { verdict: result.verdict, choice: result.choice, operatorId: result.operatorId };
+			},
+			onAudit: (event) => log.info("feishu.approval.ps_forwarding.audit", event),
+			log: (level, msg, meta) => log[level](msg, meta),
+		});
+		psForwardingParentId = parentSessionId;
+		psForwarding.start();
+	}
+
+	/**
 	 * 工具调用审批（outer hook 与子会话内联扩展共用）：返回 { block, reason } 阻断执行。
 	 * P0-02：同一实现在两个位置调用，避免“组件有实现但运行时没接上”。
 	 */
@@ -578,6 +746,12 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		// 让权给 @gotgenes/pi-permission-system：它的 tool_call 闸门在桥之前执行，
 		// deny 时桥的 handler 根本不会被调用（实测：PS 先 → 桥后，首个 block 立即返回）。
 		// 因此桥这一步只需"放行自己不再判断"，策略规则由该扩展的配置文件维护。
+		//
+		// 它的 ask **不经过这里** —— 走 approval.forwarding（PS 的父会话转发）：桥当应答方，
+		// 把请求文件变成审批卡，用户点完写回响应文件（见 approval/ps-forwarding.ts）。
+		// 所以这里继续直接放行，不能改成落到桥的弹卡逻辑：PS 的 ask 是在它自己的闸门里
+		// 等待父会话应答的，等它放行后本函数会被再调用一次，那时再弹一张卡就是对同一次
+		// 调用弹两次卡（两次判定还可能不一致）。
 		if (config.approval?.policyEngine === "pi-permission-system") {
 			if (piPermissionSystemInstalled()) {
 				return undefined;
@@ -605,6 +779,9 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 					return { block: true, reason: `该命令被安全策略拒绝：${verdict.reason}。如确需执行，请人工在宿主机操作。` };
 				}
 				log.info("feishu.approval.command_ask", { reason: verdict.reason, chatId: input.chatId });
+				// 把判定理由带进卡片：参考 hermes 的 `Reason: {description}`，
+				// 让审批人知道"为什么这条命令需要批"，而不是只看到一个命令。
+				input.reason = verdict.reason;
 			}
 		}
 		const result = await permissionBridge.gate(input);
@@ -674,6 +851,8 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 
 	async function startBridgeUnlocked(): Promise<string> {
 		if (started) return "already";
+		// 父子声明要在任何桥会话创建之前落地（PS 每次工具调用时实时读进程环境）
+		syncPsForwardingEnv();
 		try {
 			appLock = AppLock.acquire(resolveAppLockFile(homeDir, config.appId), config.appId);
 		} catch (error) {
@@ -694,10 +873,20 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			await assemble();
 			await transport!.start();
 			outbox!.start();
+			// 转发应答方要等 transport/outbox 就绪（弹卡要发得出去）。失败不阻塞桥启动：
+			// 转发只是审批的升级路径，没起来退化成 PS 自己的判定（无人应答 → 拒绝）。
+			try {
+				await syncPsForwardingServer();
+			} catch (error) {
+				log.warn("feishu.approval.ps_forwarding_start_failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 			// P1-08：空闲会话回收巡检（无 active run/排队/审批且超 TTL 才回收句柄）
 			convManager?.startLifecycle();
-			// 水合应用归属人（owner/creator）作为隐式管理员：自己驱动 agent 时不必手工维护 open_id。
-			// 注意：归属人只豁免群策略层；群内 @ 仍按 adminBypassMention（默认 false）判定。
+			// 水合应用归属人（owner/creator）与应用协作者作为隐式管理员：自己驱动 agent
+			// 时不必手工维护 open_id，且换应用后自动刷新（open_id 是按应用视角生成的）。
+			// 注意：这些人只豁免群策略层；群内 @ 仍按 adminBypassMention（默认 false）判定。
 			try {
 				const info = await transport?.rawRequest({
 					url: `/open-apis/application/v6/applications/${config.appId}`,
@@ -707,8 +896,35 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 				const app = ((info as { data?: { app?: Record<string, unknown> } })?.data?.app ?? {}) as Record<string, unknown>;
 				const ownerId = ((app.owner as { owner_id?: string } | undefined)?.owner_id)
 					?? (typeof app.creator_id === "string" ? app.creator_id : undefined);
-				config.implicitAdmins = ownerId ? [ownerId] : [];
-				log.info("feishu.config.app_owner_hydrated", { hasOwner: Boolean(ownerId), adminBypassMention: config.adminBypassMention === true });
+
+				// 协作者（owner 也在该列表中）—— 与归属人合并去重。
+				// 该接口可能因 scope 不足而失败，此时退化为仅有归属人，不影响启动。
+				let collaboratorIds: string[] = [];
+				try {
+					const collab = await transport?.rawRequest({
+						url: `/open-apis/application/v6/applications/${config.appId}/collaborators`,
+						method: "GET",
+						params: { user_id_type: "open_id", page_size: 50 },
+					});
+					const list = ((collab as { data?: { collaborators?: unknown[] } })?.data?.collaborators ?? []) as Array<Record<string, unknown>>;
+					collaboratorIds = list
+						.map((c) => (typeof c.user_id === "string" ? c.user_id : undefined))
+						.filter((v): v is string => Boolean(v));
+				} catch (collabError) {
+					log.warn("feishu.config.app_collaborators_hydrate_failed", {
+						error: collabError instanceof Error ? collabError.message : String(collabError),
+						hint: "协作者水合失败，仅归属人生效；管理员仍按 config.admins 生效",
+					});
+				}
+
+				const hydrated = [...new Set([ownerId, ...collaboratorIds].filter((v): v is string => Boolean(v)))];
+				config.implicitAdmins = hydrated;
+				log.info("feishu.config.app_owner_hydrated", {
+					hasOwner: Boolean(ownerId),
+					collaboratorCount: collaboratorIds.length,
+					totalImplicitAdmins: hydrated.length,
+					adminBypassMention: config.adminBypassMention === true,
+				});
 			} catch (error) {
 				log.warn("feishu.config.app_owner_hydrate_failed", {
 					error: error instanceof Error ? error.message : String(error),
@@ -747,6 +963,9 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		}
 		try {
 			permissionBridge?.shutdown();
+			// 先停应答方：未决的转发请求已被 shutdown() 判拒绝，等它们把响应写完再撤心跳，
+			// 否则子会话要等满 10 分钟才知道没人服务。
+			await psForwarding?.stop();
 			try { await pipeline?.stop(); } catch { /* best effort */ }
 			// P1-08：先停空闲回收巡检，避免关闭过程中回收句柄
 			convManager?.stopLifecycle();
@@ -824,6 +1043,20 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			piVersion: process.env.PI_VERSION,
 			uptimeMs: Math.round(process.uptime() * 1_000),
 			transport: { running: Boolean(transport?.isRunning()), connected: Boolean(transport?.isConnected()) },
+			forwarding: {
+				enabled: Boolean(psForwarding),
+				parentSessionId: psForwardingParentId,
+				// 心跳新鲜度 = 父会话真的在服务。缺了它子会话会判「父会话不在服务」而提前放弃，
+				// 而这种情况在日志里只表现为"等到超时"，很难定位 —— 所以 doctor 里明说。
+				serving: psForwarding ? psForwarding.isServing() : undefined,
+				alwaysApproved: alwaysApproved
+					? {
+						enabled: config.approval.forwarding?.alwaysApprove !== false,
+						count: alwaysApproved.size,
+						patterns: alwaysApproved.list().map((rule) => rule.pattern),
+					}
+					: undefined,
+			},
 		};
 	}
 
@@ -850,7 +1083,10 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 					? `限流预算: ${notice}`
 					: `限流预算: live 令牌 ${live.tokens} / 跳过 ${live.rejected} / 连续失败 ${budget.failures}`);
 			}
-			if (status.lastMessageAt) lines.push(`最近消息: ${new Date(status.lastMessageAt).toLocaleTimeString()}`);
+			if (status.lastMessageAt) {
+				// 用配置时区而不是容器时区：容器常是 UTC，直接 toLocaleTimeString() 会差 8 小时。
+				lines.push(`最近消息: ${formatTimeInZone(status.lastMessageAt, config.timezone)}`);
+			}
 			if (status.lastError) lines.push(`最近错误: ${status.lastError.slice(0, 200)}`);
 		return lines.join("\n");
 	}
@@ -874,6 +1110,40 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			return startBridge();
 		},
 	});
+	// 撤销入口：「始终批准」是一条**持久放行**，必须能看、能撤。
+	// 没有它，一次点击就等于永久挖掉一块闸门而无人能收回。
+	pi.registerCommand("feishu:always", {
+		description: "查看/撤销「始终批准」规则：/feishu:always [revoke <规则名>]",
+		handler: (_args, _ctx, args: string[]) => {
+			// TUI 是本地操作（能开 TUI 的人本来就持有进程），不做身份校验；
+			// 飞书侧的同名命令 /feishu always 有管理员校验。
+			if (!alwaysApproved) {
+				return "「始终批准」未启用（需要在 pi-permission-system 转发模式下运行）。";
+			}
+			const rules = alwaysApproved.list();
+			const [action, ...rest] = args ?? [];
+			if (action === "revoke") {
+				const pattern = rest.join(" ").trim();
+				if (!pattern) return "用法：/feishu:always revoke <规则名>（规则名见 /feishu:always）";
+				const removed = alwaysApproved.remove(pattern);
+				log.info("feishu.approval.always_revoked", { pattern, removed });
+				return removed
+					? `已撤销规则「${pattern}」—— 下次同类请求会重新弹卡。`
+					: `没有找到规则「${pattern}」。`;
+			}
+			if (rules.length === 0) return "当前没有「始终批准」的规则（所有 ask 都会弹卡）。";
+			const lines = rules.map((rule) => {
+				const when = formatTimeInZone(rule.approvedAt, config.timezone);
+				return `· ${rule.pattern}（${when}${rule.approvedBy ? ` · ${rule.approvedBy}` : ""}）`;
+			});
+			return [
+				`「始终批准」规则共 ${rules.length} 条：`,
+				...lines,
+				"用 /feishu:always revoke <规则名> 撤销。",
+			].join("\n");
+		},
+	});
+
 	pi.registerCommand("feishu:policy", {
 		description: "设置单群策略：/feishu:policy <chatId> <open|mention|disabled|allowlist>",
 		handler: (_args, _ctx, args: string[]) => {
@@ -919,6 +1189,8 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async () => {
 		homeDir = process.env.FEISHU_BRIDGE_HOME ?? pi.getAgentDir();
 		config = loadConfig(homeDir);
+		// PS 父会话转发的父子声明越早越好：它要在任何桥会话被创建之前就位。
+		syncPsForwardingEnv();
 		if (!config.appId || !config.appSecret) {
 			log.warn("FEISHU_APP_ID/SECRET 未配置，桥未启动。请配置后运行 /feishu:start。");
 			return;
@@ -954,13 +1226,19 @@ function extractBashCommand(paramsText: string): string | undefined {
 	}
 }
 
+/** pi 配置目录（PI_CODING_AGENT_DIR）：PS 的转发目录就在它下面。 */
+function resolveAgentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR ?? join(process.cwd(), "pi-agent");
+}
+
 /**
  * 检查 @gotgenes/pi-permission-system 是否真的装在 agent 目录里。
  * 用途：policyEngine=pi-permission-system 时的失败关闭判定 —— 若扩展缺席，
  * 桥的审批就是唯一防线，此时必须继续用自己的策略而不是静默放行。
+ * 父会话转发（approval.forwarding）也复用该判定：扩展不在就没有 ask 会转发过来。
  */
 function piPermissionSystemInstalled(): boolean {
-	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(process.cwd(), "pi-agent");
+	const agentDir = resolveAgentDir();
 	const candidates = [
 		join(agentDir, "npm", "node_modules", "@gotgenes", "pi-permission-system"),
 		join(agentDir, "extensions", "pi-permission-system"),

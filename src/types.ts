@@ -31,6 +31,13 @@ export interface BridgeConfig {
 	botUserId?: string;
 	botName?: string;
 
+	/**
+	 * 展示用时区（IANA 名称，如 Asia/Shanghai）。
+	 * 解析顺序：FEISHU_TIMEZONE 环境变量 > config.json > 容器 TZ > 默认 Asia/Shanghai。
+	 * 只影响「面向用户的时间显示」；对时间戳存储/比较没有影响（那些一律用 epoch）。
+	 */
+	timezone: string;
+
 	groupPolicy: GroupPolicy;
 	/** 每群策略覆盖（优先于全局）——保留向后兼容 */
 	groupPolicyByChat: Record<string, GroupPolicy>;
@@ -41,6 +48,11 @@ export interface BridgeConfig {
 	/** 群白名单；空数组 = 全部群按策略 */
 	allowChats: string[];
 	/** DM 白名单；空 = 全部放行 */
+	/**
+	 * 允许私聊（DM）的用户 open_id 白名单。
+	 * fail-closed：空数组 = 拒绝所有私聊；管理员与应用归属人例外，
+	 * 始终放行（归属人随应用自动刷新，无需手工维护）。
+	 */
 	allowUsers: string[];
 	/**
 	 * 管理员与「应用归属人」是否豁免 @ 检查（**默认 false**）。
@@ -56,9 +68,16 @@ export interface BridgeConfig {
 	/** 管理员 open_id；豁免群策略层（@ 层由 adminBypassMention 决定） */
 	admins: string[];
 	/**
-	 * 允许触发桥的 bot/app 白名单（app_id 或 bot open_id）。
-	 * 默认空 = 拒绝所有 bot 消息（hermes allow_bots=none 的安全默认）；
-	 * 需要自定义机器人/webhook 或兄弟应用驱动时显式登记。
+	 * 允许触发桥的 bot/app 白名单。
+	 *
+	 * 元素可以是：
+	 * - `app_id`（如 cli_xxx）—— 跨应用稳定，推荐；
+	 * - `open_bot_id`（如 ou_xxx）—— 按应用视角生成，换应用后失效；
+	 * - 特殊值 `"mentions"` —— 任何 bot 消息只要 @ 了本 bot 就放行
+	 *   （对齐 hermes allow_bots=mentions）。不依赖 id，故换应用后不失效，
+	 *   且天然防死循环：两个 bot 自动互回时不会互相 @。
+	 *
+	 * 默认空 = 拒绝所有 bot 消息（hermes allow_bots=none 的安全默认）。
 	 */
 	allowBots?: string[];
 	/** run 空闲超时（无任何事件产出才算）；0 = 关闭。默认 10 分钟。 */
@@ -111,6 +130,25 @@ export interface BridgeConfig {
 			extraReadOnly?: string[];
 			extraDangerous?: string[];
 		};
+		/**
+		 * pi-permission-system 父会话转发（**默认关闭**，实验性）。
+		 *
+		 * 打开后桥充当该扩展的「父会话应答方」：在进程环境里声明父子关系（PI_SUBAGENT_PARENT_SESSION，
+		 * 见 approval/ps-forwarding.ts 的 PS_FORWARDING_PARENT_ENV_KEYS），
+		 * 并在 <agentDir>/sessions/permission-forwarding/ 下发布心跳 + 轮询子会话写入的请求文件，
+		 * 把 PS 的 ask 变成飞书审批卡。
+		 * 关闭时桥不碰该环境变量、不读写转发目录（保持 33.0.3 的现状：ask 无人应答 → 拒绝）。
+		 */
+		forwarding?: {
+			enabled: boolean;
+			/** 桥侧父会话 id（PS 用它命名转发目录；必须稳定且不等于任何真实 session id）。 */
+			parentSessionId?: string;
+			/**
+			 * 「始终批准」规则表（默认 true）。开启后审批卡多一个 always 按钮；
+			 * 命中已记规则的请求直接放行、不再弹卡。撤销见 `/feishu always revoke`。
+			 */
+			alwaysApprove?: boolean;
+		};
 	};
 	reaction: { processingEmoji: string; enabled: boolean };
 	/**
@@ -154,6 +192,8 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 	appId: "",
 	appSecret: "",
 	domain: "feishu",
+	// 默认上海：容器基础镜像是 UTC，不显式指定的话用户看到的时间会差 8 小时
+	timezone: "Asia/Shanghai",
 	groupPolicy: "mention",
 	groupPolicyByChat: {},
 	groupRules: {},
@@ -172,7 +212,18 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 	adminBypassMention: false,
 	batch: { enabled: true, textWindowMs: 3000, maxMessages: 8, maxChars: 12_000 },
 	forwarding: { acceptMergeForward: true },
-	approval: { autoApprove: [], timeoutMs: 300_000, adminSkipApproval: false, commandPolicy: { enabled: true } },
+	approval: {
+		autoApprove: [], timeoutMs: 300_000, adminSkipApproval: false, commandPolicy: { enabled: true },
+		// 实验性：默认关闭。打开前先确认 pi-permission-system 的 ask 规则确实需要人工判定。
+		forwarding: {
+			enabled: false,
+			// 「始终批准」：桥侧维护规则表，命中规则的转发请求直接放行、不再弹卡。
+			// 语义等价于 PS 原生对话框的「始终批准」（PS 记在父会话 SessionRules 里，
+			// 桥走不到那条路，改为按规则名记在自己的表里）。默认开 —— 它需要管理员
+			// 主动点卡片才生效，且撤销入口存在（/feishu always revoke）。
+			alwaysApprove: true,
+		},
+	},
 	reaction: { processingEmoji: "Typing", enabled: true },
 	footer: { enabled: true, showCost: true },
 	sessionLifecycle: { idleTtlMs: 30 * 60_000, maxResidentSessions: 32, sweepIntervalMs: 60_000 },

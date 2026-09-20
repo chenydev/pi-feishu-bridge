@@ -92,3 +92,64 @@ test("审批：审计记录包含 run/tool/card/operator 关联字段", async ()
 	assert.equal(final?.cardMessageId, "audit-card");
 	assert.equal(final?.operatorOpenId, "admin");
 });
+
+test("外部审批源（PS 父会话转发）：不提供「始终批准」，且选择要带回给转发响应", async () => {
+	let pending: { id: string; token: string; choices?: string[] } | undefined;
+	const audits: Array<Record<string, unknown>> = [];
+	const bridge = new PermissionBridge({
+		getConfig: () => ({ autoApprove: [], timeoutMs: 1_000 }),
+		onAsk: async (value) => { pending = value; return "fwd-card"; },
+		onAudit: (event) => audits.push(event),
+	});
+	const work = bridge.requestExternal({
+		conversationKey: "oc:u:ou_admin", sessionId: "sess-child", runId: "run-child",
+		toolCallId: "req-1", toolName: "bash", paramsText: "echo hi", chatId: "oc",
+		allowedOperatorIds: ["ou_admin"], choices: ["once", "session", "deny"],
+	});
+	assert.deepEqual(pending?.choices, ["once", "session", "deny"], "选项必须被收窄");
+	assert.equal(bridge.pendingCount(), 1);
+	// 等卡片结果落位（cardMessageId 是 decide 的上下文校验项之一）
+	await new Promise((resolve) => setTimeout(resolve, 0));
+
+	// 不给的选项必须被拒，且不消费审批（卡片回调可被重放，白名单要在消费之前校验）
+	const rejected = bridge.decide({
+		id: pending!.id, token: pending!.token, messageId: "fwd-card", chatId: "oc",
+		operatorOpenId: "ou_admin", choice: "always",
+	});
+	assert.equal(rejected.ok, false);
+	assert.match(rejected.reason, /不支持此选项/);
+	assert.equal(bridge.pendingCount(), 1);
+
+	assert.equal(bridge.decide({
+		id: pending!.id, token: pending!.token, messageId: "fwd-card", chatId: "oc",
+		operatorOpenId: "ou_admin", choice: "session",
+	}).ok, true);
+	const result = await work;
+	assert.equal(result.verdict, "approved");
+	assert.equal(result.choice, "session", "转发响应要靠它区分「仅本次」与「本会话」");
+	assert.equal(audits[0]?.decision, "external_ask", "外部来源在审计里可区分（桥侧转发路径会传 ps_forwarding_ask）");
+});
+
+test("外部审批源：卡片发送失败按拒绝收尾（与自研路径一致）", async () => {
+	const bridge = new PermissionBridge({
+		getConfig: () => ({ autoApprove: [], timeoutMs: 1_000 }),
+		onAsk: async () => undefined,
+	});
+	const result = await bridge.requestExternal({
+		conversationKey: "oc:u:ou_admin", sessionId: "s", runId: "r", toolCallId: "req-2",
+		toolName: "bash", paramsText: "echo hi", chatId: "oc", allowedOperatorIds: ["ou_admin"],
+		choices: ["once", "deny"],
+	});
+	assert.equal(result.verdict, "denied");
+	assert.equal(bridge.pendingCount(), 0);
+});
+
+test("外部审批源：审批卡等待上限可以单独指定（不得越过上游转发超时）", async () => {
+	const bridge = new PermissionBridge({ getConfig: () => ({ autoApprove: [], timeoutMs: 60_000 }), onAsk: async () => "card" });
+	const result = await bridge.requestExternal({
+		conversationKey: "oc:u:ou_admin", sessionId: "s", runId: "r", toolCallId: "req-3",
+		toolName: "bash", paramsText: "echo hi", chatId: "oc", allowedOperatorIds: ["ou_admin"],
+		choices: ["once", "deny"],
+	}, { timeoutMs: 5 });
+	assert.equal(result.verdict, "timeout", "转发路径用 5ms 上限而不是全局的 60s");
+});

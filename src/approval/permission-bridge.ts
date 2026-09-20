@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 
 export type ToolDecision = "allow" | "ask" | "deny";
 export type ApprovalChoice = "once" | "session" | "always" | "deny";
+/** 卡片/校验的选项顺序（四档全开时的默认集合）。 */
+export const ALL_APPROVAL_CHOICES: readonly ApprovalChoice[] = ["once", "session", "always", "deny"];
 /** 卡片终态（用于把已发出的卡片置灰）。 */
 export type ApprovalCardTerminal = "timeout" | "approved" | "denied" | "invalidated";
 
@@ -19,16 +21,45 @@ export interface PendingApproval {
 	toolCallId: string;
 	toolName: string;
 	paramsText: string;
+	/**
+	 * 为什么需要审批（来自命令级策略的判定，如"不在只读白名单"）。
+	 * 参考 hermes 的 `Reason: {description}` —— 让审批人知道自己在批什么，
+	 * 而不是看到一个孤零零的命令就凭感觉点。
+	 */
+	reason?: string;
 	chatId: string;
 	threadId?: string;
 	sourceMessageId?: string;
 	allowedOperatorIds: string[];
+	/**
+	 * 本审批允许的选项。外部审批源（如 pi-permission-system 转发）可收窄。
+	 * 转发路径现在**提供** always：桥侧用规则表实现等价语义（PS 原生把它记在
+	 * 父会话的 SessionRules 里，桥走不到那条路，改为记 matchedPattern）。
+	 * 缺省为四档全开。
+	 */
+	choices?: ApprovalChoice[];
+	/**
+	 * 用户实际点的选项（超时/失效/被撤销时没有）。
+	 * 转发响应必须区分「仅本次」与「本会话」（对应 PS 的 approved / approved_for_session）。
+	 */
+	resolvedChoice?: ApprovalChoice;
+	/**
+	 * 实际点卡片的操作者 open_id（已通过 allowedOperatorIds 校验）。
+	 * 外部审批源用它做持久化审计 —— 比如转发路径的「始终批准」要记下是谁放行的。
+	 */
+	operatorOpenId?: string;
 	cardMessageId?: string;
 	expiresAt: number;
 	verdict: Promise<ApprovalVerdict>;
 	resolve: (verdict: ApprovalVerdict) => void;
 	timer?: ReturnType<typeof setTimeout>;
 }
+
+/** 未决审批的调用方输入（id/token/cardMessageId/expiresAt/verdict/resolve/timer 由 bridge 生成）。 */
+export type PendingApprovalInput = Omit<
+	PendingApproval,
+	"id" | "token" | "cardMessageId" | "expiresAt" | "verdict" | "resolve" | "timer" | "resolvedChoice"
+>;
 
 export interface PermissionBridgeDeps {
 	getConfig: () => { autoApprove: string[]; timeoutMs: number };
@@ -43,6 +74,8 @@ export interface PermissionBridgeDeps {
 	onAudit?: (event: {
 		approvalId?: string; conversationKey: string; sessionId: string; runId: string; toolCallId: string;
 		toolName: string; decision: string; paramsSummary: string; cardMessageId?: string; operatorOpenId?: string;
+		/** 该审批实际提供的选项（排障用：能看出卡片该有几个按钮）。 */
+		choices?: readonly ApprovalChoice[];
 	}) => void;
 	now?: () => number;
 }
@@ -86,7 +119,7 @@ export class PermissionBridge {
 		this.now = deps.now ?? Date.now;
 	}
 
-	async gate(input: Omit<PendingApproval, "id" | "token" | "cardMessageId" | "expiresAt" | "verdict" | "resolve" | "timer">): Promise<{ decision: ToolDecision; verdict?: Promise<ApprovalVerdict> }> {
+	async gate(input: PendingApprovalInput): Promise<{ decision: ToolDecision; verdict?: Promise<ApprovalVerdict> }> {
 		const config = this.deps.getConfig();
 		const decision = classifyToolCall(input.toolName, config.autoApprove, this.sessionAllow.get(input.conversationKey) ?? new Set());
 		this.deps.onAudit?.({
@@ -94,34 +127,32 @@ export class PermissionBridge {
 			toolCallId: input.toolCallId, toolName: input.toolName, decision, paramsSummary: input.paramsText,
 		});
 		if (decision !== "ask") return { decision };
-		let resolveVerdict: (value: ApprovalVerdict) => void = () => {};
-		const verdict = new Promise<ApprovalVerdict>((resolve) => { resolveVerdict = resolve; });
-		const pending: PendingApproval = {
-			...input, id: randomUUID(), token: randomUUID(), expiresAt: this.now() + config.timeoutMs,
-			verdict, resolve: resolveVerdict,
-		};
-		this.pending.set(pending.id, pending);
-		pending.timer = setTimeout(() => this.expire(pending.id), config.timeoutMs);
-		pending.timer.unref?.();
-		try {
-			const cardMessageId = await Promise.race([
-				this.deps.onAsk(pending),
-				verdict.then(() => undefined),
-			]);
-			// timeout/shutdown 已消费 pending；迟到的卡片结果不得复活审批。
-			if (!this.pending.has(pending.id)) return { decision, verdict };
-			pending.cardMessageId = cardMessageId;
-			if (!pending.cardMessageId) throw new Error("approval card send failed");
-		} catch (error) {
-			// 卡片发送失败必须留痕：早期版本这里静默吞错，导致「审批直接被拒」无法定位。
-			this.deps.onAudit?.({
-				conversationKey: pending.conversationKey, sessionId: pending.sessionId, runId: pending.runId,
-				toolCallId: pending.toolCallId, toolName: pending.toolName, decision: "card_failed",
-				paramsSummary: error instanceof Error ? error.message : String(error),
-			});
-			this.consume(pending, "denied");
-		}
-		return { decision, verdict };
+		const pending = this.enqueue(input, config.timeoutMs);
+		await this.announce(pending);
+		return { decision, verdict: pending.verdict };
+	}
+
+	/**
+	 * 外部审批源（pi-permission-system 父会话转发）：该请求已经由外部策略判定为
+	 * 「需要人工批准」，因此不再走桥的分类器，直接登记 + 弹卡，并把用户的选择
+	 * 一并带回（转发响应必须区分「仅本次」与「本会话」）。
+	 */
+	async requestExternal(
+		input: PendingApprovalInput,
+		options: { timeoutMs?: number; auditDecision?: string } = {},
+	): Promise<{ pending: PendingApproval; verdict: ApprovalVerdict; choice?: ApprovalChoice; operatorId?: string }> {
+		const pending = this.enqueue(input, options.timeoutMs ?? this.deps.getConfig().timeoutMs);
+		this.deps.onAudit?.({
+			conversationKey: pending.conversationKey, sessionId: pending.sessionId, runId: pending.runId,
+			toolCallId: pending.toolCallId, toolName: pending.toolName,
+			decision: options.auditDecision ?? "external_ask", paramsSummary: pending.paramsText,
+			// 把实际可选项打进审计：排障时能一眼看出"这张卡该有几个按钮"，
+			// 而不用去比对发卡时刻的配置状态（配置可能已经被改过）。
+			choices: pending.choices ?? ALL_APPROVAL_CHOICES,
+		});
+		await this.announce(pending);
+		const verdict = await pending.verdict;
+		return { pending, verdict, choice: pending.resolvedChoice, operatorId: pending.operatorOpenId };
 	}
 
 	decide(input: { id: string; token: string; messageId: string; chatId?: string; operatorOpenId: string; choice: ApprovalChoice }): { ok: boolean; reason: string; pending?: PendingApproval } {
@@ -129,6 +160,9 @@ export class PermissionBridge {
 		if (!pending) return { ok: false, reason: "审批已失效" };
 		if (this.now() > pending.expiresAt) { this.consume(pending, "timeout"); return { ok: false, reason: "审批已超时" }; }
 		if (!pending.allowedOperatorIds.includes(input.operatorOpenId)) return { ok: false, reason: "仅管理员可审批" };
+		// 选项白名单：外部审批源可能只提供子集（例如转发路径不给「始终批准」）。
+		// 必须在消费之前校验 —— 否则一张被重放/伪造的回调能把「不给的选项」变成授权。
+		if (!(pending.choices ?? ALL_APPROVAL_CHOICES).includes(input.choice)) return { ok: false, reason: "该审批不支持此选项" };
 		if (input.token !== pending.token || input.messageId !== pending.cardMessageId || input.chatId !== pending.chatId) return { ok: false, reason: "审批上下文不匹配" };
 
 		// P0-03：“始终允许”必须先落盘成功才放行；落盘失败按拒绝处理，不得反馈持久授权成功。
@@ -145,6 +179,7 @@ export class PermissionBridge {
 			}
 		}
 
+		pending.operatorOpenId = input.operatorOpenId;
 		this.pending.delete(pending.id);
 		if (pending.timer) clearTimeout(pending.timer);
 		if (input.choice === "session") {
@@ -153,6 +188,7 @@ export class PermissionBridge {
 			this.sessionAllow.set(pending.conversationKey, allowed);
 		}
 		const approved = input.choice !== "deny";
+		pending.resolvedChoice = input.choice;
 		pending.resolve(approved ? "approved" : "denied");
 		this.deps.onAudit?.({
 			approvalId: pending.id, conversationKey: pending.conversationKey, sessionId: pending.sessionId,
@@ -220,6 +256,46 @@ export class PermissionBridge {
 	private expire(id: string): void {
 		const pending = this.pending.get(id);
 		if (pending) this.consume(pending, "timeout");
+	}
+
+	/** 登记一条未决审批并起超时定时器（gate 与外部审批源共用）。 */
+	private enqueue(input: PendingApprovalInput, timeoutMs: number): PendingApproval {
+		let resolveVerdict: (value: ApprovalVerdict) => void = () => {};
+		const verdict = new Promise<ApprovalVerdict>((resolve) => { resolveVerdict = resolve; });
+		const pending: PendingApproval = {
+			...input, id: randomUUID(), token: randomUUID(), expiresAt: this.now() + timeoutMs,
+			// 缺省四档全开：桥自研路径的选项集合不变。
+			choices: input.choices ?? [...ALL_APPROVAL_CHOICES],
+			verdict, resolve: resolveVerdict,
+		};
+		this.pending.set(pending.id, pending);
+		pending.timer = setTimeout(() => this.expire(pending.id), timeoutMs);
+		pending.timer.unref?.();
+		return pending;
+	}
+
+	/**
+	 * 弹卡并等卡片结果落位：timeout/shutdown 已消费 pending 时，
+	 * 迟到的卡片结果不得复活审批（因此这里不复用返回的卡 id）。
+	 */
+	private async announce(pending: PendingApproval): Promise<void> {
+		try {
+			const cardMessageId = await Promise.race([
+				this.deps.onAsk(pending),
+				pending.verdict.then(() => undefined),
+			]);
+			if (!this.pending.has(pending.id)) return;
+			pending.cardMessageId = cardMessageId;
+			if (!pending.cardMessageId) throw new Error("approval card send failed");
+		} catch (error) {
+			// 卡片发送失败必须留痕：早期版本这里静默吞错，导致「审批直接被拒」无法定位。
+			this.deps.onAudit?.({
+				conversationKey: pending.conversationKey, sessionId: pending.sessionId, runId: pending.runId,
+				toolCallId: pending.toolCallId, toolName: pending.toolName, decision: "card_failed",
+				paramsSummary: error instanceof Error ? error.message : String(error),
+			});
+			this.consume(pending, "denied");
+		}
 	}
 
 	private consume(pending: PendingApproval, verdict: ApprovalVerdict): void {
