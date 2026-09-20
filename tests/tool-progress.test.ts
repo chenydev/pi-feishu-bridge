@@ -17,7 +17,7 @@ import { DEFAULT_CONFIG, type BridgeConfig, type FeishuInboundMessage, type Sess
 
 function config(over: Partial<BridgeConfig> = {}): BridgeConfig {
 	return {
-		...DEFAULT_CONFIG,
+		...DEFAULT_CONFIG, allowChats: ["oc_group", "oc_chat", "oc_x", "oc_real_chat", "oc_a", "oc_b", "oc_g", "oc_y", "oc_other", "oc_ok"],
 		reaction: { ...DEFAULT_CONFIG.reaction, enabled: false },
 		footer: { enabled: false, showCost: false },
 		batch: { ...DEFAULT_CONFIG.batch, enabled: false },

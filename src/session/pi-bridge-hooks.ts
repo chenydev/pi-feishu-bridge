@@ -30,6 +30,8 @@ export interface BridgeGateInput {
 	toolCallId: string;
 	toolName: string;
 	paramsText: string;
+	/** 需要审批的理由（命令级策略判定结果，用于审批卡展示）。 */
+	reason?: string;
 	chatId: string;
 	threadId?: string;
 	sourceMessageId?: string;

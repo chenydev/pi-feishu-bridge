@@ -15,7 +15,7 @@ import { ConversationStore } from "../src/session/conversation-store.js";
 import { DEFAULT_CONFIG, type BridgeConfig, type FeishuInboundMessage, type SessionBackend } from "../src/types.js";
 
 function config(over: Partial<BridgeConfig> = {}): BridgeConfig {
-	return { ...DEFAULT_CONFIG, reaction: { ...DEFAULT_CONFIG.reaction, enabled: false }, ...over };
+	return { ...DEFAULT_CONFIG, allowChats: ["oc_group", "oc_chat", "oc_x", "oc_real_chat", "oc_a", "oc_b", "oc_g", "oc_y", "oc_other", "oc_ok"], reaction: { ...DEFAULT_CONFIG.reaction, enabled: false }, ...over };
 }
 
 function message(messageId: string): FeishuInboundMessage {

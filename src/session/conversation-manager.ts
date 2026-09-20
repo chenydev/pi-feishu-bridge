@@ -202,6 +202,14 @@ function resolveSessionFile(
 
 export class ConversationManager {
 	private sessions = new Map<string, BridgeSession>();
+	/**
+	 * 恢复提示（对齐 hermes build_resume_recovery_note）：崩溃恢复后给模型注入
+	 * 一条方括号元信息，告诉它"上次中断了，不要重跑历史里未完成的工具调用"。
+	 * 按 conversationKey 索引 —— 恢复后用户会发**新**消息（新 messageId），
+	 * 按被中断那条消息的 id 索引永远匹配不上。注入一次即删除；
+	 * 只在内存里，不落盘、不发给用户。
+	 */
+	private readonly recoveryNotes = new Map<string, string>();
 	private runIdleTimeoutMs: number;
 	private runMaxDurationMs: number;
 	private now: () => number;
@@ -397,6 +405,11 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		if (!this.pendingEnabled) return 0;
 		const entries = this.pendingStore?.recoverable() ?? [];
 		for (const e of entries) {
+			// 命令类消息不重放：重放一个 /new 等于再清一次上下文，重放 /stop 会打断新任务。
+			if (e.replayPolicy === "never") {
+				this.pendingStore?.ack(e.id);
+				continue;
+			}
 			this.deps.log?.("warn", "feishu.conv.recover_pending", { chatId: e.message.chatId, messageId: e.message.messageId });
 			if (e.replayPolicy === "manual") {
 				const handled = await this.notify(
@@ -407,6 +420,12 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 					e.conversationKey,
 					"error",
 				);
+				// 同时让模型自己也知道"上次中断过" —— 对齐 hermes 的
+				// "Do NOT re-execute old tool calls"，避免它从历史里自行
+				// 推断并重试旧工具调用（用户看不到这条，它只进模型上下文）。
+				this.recoveryNotes.set(e.conversationKey,
+					"[系统提示：本会话上次在工具执行期间被中断。不要重新执行对话历史中未完成的工具调用；"
+					+ "如果用户要求继续，先确认当前实际状态再决定下一步。]");
 				if (handled) this.pendingStore?.ack(e.id);
 				continue;
 			}
@@ -433,6 +452,9 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		return {
 			claim: (msg, conversationKey) => {
 				store.claim(msg, conversationKey);
+			},
+			markNever: (id) => {
+				store.markNever(id);
 			},
 			has: (id) => store.has(id),
 			merge: (primaryId, memberIds, merged) => {
@@ -551,7 +573,7 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		return result === "rejected" ? "rejected" : "queued";
 	}
 
-	private async prepareAgentInput(item: QueuedMessage): Promise<{
+	private async prepareAgentInput(item: QueuedMessage, conversationKey: string): Promise<{
 		text: string;
 		images?: import("../types.js").PiImageContent[];
 		resources?: ResolvedTurnResources;
@@ -564,10 +586,17 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		}
 		if (item.replyToMessageId && item.replyToText) {
 			const quote = item.replyToText.slice(0, 500).replace(/@_user_\w+/g, "@").replace(/\n/g, " ");
-			const replyingToSelf = Boolean(this.deps.lastSent?.has(item.replyToMessageId));
+		const replyingToSelf = Boolean(this.deps.lastSent?.has(item.replyToMessageId));
 			text = replyingToSelf
 				? `[你正在回复自己上一条消息，原文："${quote}"]\n\n${text}`
 				: `[正在回复的消息原文："${quote}"]\n\n${text}`;
+		}
+		// 恢复提示：一次性注入。注意必须放在 replyTo 分支之外 ——
+		// 崩溃恢复后用户重发的消息通常不带回复引用，若写在分支内就永远不会生效。
+		const recoveryNote = this.recoveryNotes.get(conversationKey);
+		if (recoveryNote) {
+			text = `${recoveryNote}\n\n${text}`;
+			this.recoveryNotes.delete(conversationKey);
 		}
 		return { text, images: resources?.images, resources };
 	}
@@ -808,6 +837,72 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 	 * P1-06：列出已认证模型（provider 用于区分同名模型）。
 	 * 首次调用会懒初始化会话，避免"当前会话尚未建立"。
 	 */
+	/**
+	 * 供 /models 卡片使用的数据快照：模型清单 + 当前模型 + 会话 key。
+	 * 返回 null 表示无法获取（调用方回退到文本版 listModels）。
+	 */
+	async modelsCardData(msg: FeishuInboundMessage): Promise<{
+		models: Array<{ id: string; provider?: string }>; currentId: string; conversationKey: string;
+	} | null> {
+		const key = buildConversationKey(msg, this.deps.config);
+		const session = this.getOrCreateSession(msg, key);
+		let agent: AgentHandle;
+		try {
+			agent = await this.ensureAgentSession(session);
+		} catch (error) {
+			this.deps.log?.("error", "feishu.conv.models_init_failed", {
+				conversationKey: key, error: error instanceof Error ? error.message : String(error),
+			});
+			return null;
+		}
+		if (!agent.listModels) return null;
+		try {
+			const models = await agent.listModels();
+			if (models.length === 0) return null;
+			return { models, currentId: agent.modelId, conversationKey: key };
+		} catch {
+			return null;
+		}
+	}
+
+	/** 卡片翻页：按 conversationKey 重建数据（key 由卡片回调带回，不猜用户身份）。 */
+	async modelsCardDataByKey(conversationKey: string): Promise<{
+		models: Array<{ id: string; provider?: string }>; currentId: string; conversationKey: string;
+	} | null> {
+		const session = this.sessions.get(conversationKey);
+		if (!session) return null;
+		const agent = session.agent ?? await this.ensureAgentSession(session).catch(() => undefined);
+		if (!agent?.listModels) return null;
+		try {
+			const models = await agent.listModels();
+			if (models.length === 0) return null;
+			return { models, currentId: agent.modelId, conversationKey };
+		} catch {
+			return null;
+		}
+	}
+
+	/** 卡片点击切换：按 key 找到会话并切换模型（target 形如 provider/id 或 id）。 */
+	async setModelByKey(conversationKey: string, target: string): Promise<{
+		ok: boolean; reason: string;
+		data: { models: Array<{ id: string; provider?: string }>; currentId: string; conversationKey: string };
+	} | null> {
+		const session = this.sessions.get(conversationKey);
+		if (!session) return null;
+		if (session.activeRun) return { ok: false, reason: "当前会话仍在执行，请稍后切换模型", data: (await this.modelsCardDataByKey(conversationKey))! };
+		let agent: AgentHandle;
+		try {
+			agent = session.agent ?? await this.ensureAgentSession(session);
+		} catch {
+			return null;
+		}
+		if (!agent.setModel) return { ok: false, reason: "当前 Pi 版本不支持远程切换模型", data: (await this.modelsCardDataByKey(conversationKey))! };
+		const ok = await agent.setModel(target);
+		const data = await this.modelsCardDataByKey(conversationKey);
+		if (!data) return null;
+		return { ok, reason: ok ? "" : `找不到已认证模型：${target}`, data };
+	}
+
 	async listModels(msg: FeishuInboundMessage, page = 0): Promise<string> {
 		const key = buildConversationKey(msg, this.deps.config);
 		const session = this.getOrCreateSession(msg, key);
@@ -980,7 +1075,7 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		let prepared: Awaited<ReturnType<ConversationManager["prepareAgentInput"]>> | undefined;
 		let accepted = false;
 		try {
-			prepared = await this.prepareAgentInput(item);
+			prepared = await this.prepareAgentInput(item, sess.conversationKey);
 			if (!sess.activeRun || sess.agent !== agent || !this.activeItems.has(sess.conversationKey)) return false;
 			await agent.steer(prepared.text, prepared.images);
 			accepted = true;
@@ -1080,7 +1175,9 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		const key = buildConversationKey(msg, this.deps.config);
 		const session = this.getOrCreateSession(msg, key);
 		if (session.activeRun && !session.agent) return "当前会话正在初始化模型，请稍后重试";
-		if (!modelId && session.agent) return `当前模型：${session.agent.modelId}`;
+		// 不带参数 = 展示型查询（对齐 hermes /model）：给出当前模型、可用候选与切换语法，
+		// 而不是只回一行「当前模型：x」让用户不知道下一步该输什么。
+		if (!modelId && session.agent) return await this.describeModel(session.agent);
 		if (session.activeRun) return "当前会话仍在执行，请稍后切换模型";
 		let agent: AgentHandle;
 		try {
@@ -1092,9 +1189,41 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 			});
 			return "模型会话初始化失败，请稍后重试";
 		}
-		if (!modelId) return `当前模型：${agent.modelId}`;
+		if (!modelId) return await this.describeModel(agent);
 		if (!agent.setModel) return "当前 Pi 版本不支持远程切换模型";
 		return await agent.setModel(modelId) ? `已切换模型：${modelId}` : `找不到已认证模型：${modelId}`;
+	}
+
+	/**
+	 * 构造 /model 的展示文本：当前模型 + 可用候选 + 切换语法。
+	 * 候选有上限（默认 10），超出时指向 /models 分页查看 —— 模型多时避免刷屏。
+	 * 列模型时一律带 provider 前缀，因为同名 id 可能来自不同 provider
+	 * （例如自建网关与官方 API 都可能有同名模型）。
+	 */
+	private async describeModel(agent: AgentHandle, limit = 10): Promise<string> {
+		const current = agent.modelId;
+		const lines: string[] = [`当前模型：${current}`];
+		const thinking = agent.thinkingLevel?.();
+		if (thinking) lines[0] += `　思考等级：${thinking}`;
+
+		let all: Array<{ id: string; provider?: string }> = [];
+		try {
+			all = (await agent.listModels?.()) ?? [];
+		} catch {
+			// 列出候选失败不影响展示当前模型（例如 provider 暂时不可达）
+		}
+		const candidates = all.filter((entry) => entry.id !== current);
+		if (candidates.length > 0) {
+			const shown = candidates.slice(0, limit);
+			lines.push("", `可切换（${candidates.length}）`);
+			for (const entry of shown) {
+				const label = entry.provider ? `${entry.provider}/${entry.id}` : entry.id;
+				lines.push(`· ${label}`);
+			}
+			if (candidates.length > shown.length) lines.push(`· …其余 ${candidates.length - shown.length} 个`);
+		}
+		lines.push("", "切换：/model <模型>　查看全部：/models　思考等级：/thinking");
+		return lines.join("\n");
 	}
 
 	private getOrCreateSession(msg: FeishuInboundMessage, key: string): BridgeSession {
@@ -1275,7 +1404,7 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 			let lastEndText = "";
 			let agentError: string | undefined;
 			let sentFromEvent = false;
-			const preparedInput = await this.prepareAgentInput(item);
+			const preparedInput = await this.prepareAgentInput(item, sess.conversationKey);
 			const injectedPrompt = preparedInput.text;
 			resolvedResources = preparedInput.resources;
 			const sendReply = async (text: string): Promise<void> => {

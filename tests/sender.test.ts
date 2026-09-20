@@ -13,7 +13,7 @@ import type { FeishuTransport } from "../src/inbound/transport.js";
 import { validateLocalArtifact } from "../src/outbound/artifact.js";
 
 function cfg(over: Partial<BridgeConfig> = {}): BridgeConfig {
-	return { ...DEFAULT_CONFIG, ...over };
+	return { ...DEFAULT_CONFIG, allowChats: ["oc_group", "oc_chat", "oc_x", "oc_real_chat", "oc_a", "oc_b", "oc_g", "oc_y", "oc_other", "oc_ok"], ...over };
 }
 
 test("truncateMessage：按换行切分", () => {

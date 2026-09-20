@@ -180,7 +180,7 @@ test("P1-01：卡片承载 final 后必须 ack 接管账本（否则重启会重
 		};
 		const manager = new ConversationManager({
 			config: {
-				...DEFAULT_CONFIG,
+				...DEFAULT_CONFIG, allowChats: ["oc_group", "oc_chat", "oc_x", "oc_real_chat", "oc_a", "oc_b", "oc_g", "oc_y", "oc_other", "oc_ok"],
 				streamingCard: { enabled: true, throttleMs: 0 },
 				footer: { enabled: false, showCost: false },
 				reaction: { ...DEFAULT_CONFIG.reaction, enabled: false },

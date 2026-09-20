@@ -15,7 +15,7 @@ import { buildDiagnosticsBundle, writeDiagnosticsBundle } from "../src/runtime/d
 import { DEFAULT_CONFIG, type BridgeConfig } from "../src/types.js";
 
 function config(): BridgeConfig {
-	return { ...DEFAULT_CONFIG, appId: "cli_test", appSecret: "super-secret-value", admins: ["ou_admin"] };
+	return { ...DEFAULT_CONFIG, allowChats: ["oc_group", "oc_chat", "oc_x", "oc_real_chat", "oc_a", "oc_b", "oc_g", "oc_y", "oc_other", "oc_ok"], appId: "cli_test", appSecret: "super-secret-value", admins: ["ou_admin"] };
 }
 
 function paths(dir: string) {

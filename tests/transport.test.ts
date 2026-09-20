@@ -50,7 +50,7 @@ function fakeSdk(historyItems: unknown[] = [], resource = Buffer.from("resource"
 
 function transport(sdk: LarkSdkLike, over: { now?: () => number; statuses?: string[]; onCardAction?: (action: import("../src/inbound/transport.js").CardAction) => Promise<unknown> } = {}) {
 	return new FeishuTransport({
-		config: { ...DEFAULT_CONFIG, appId: "app", appSecret: "secret" },
+		config: { ...DEFAULT_CONFIG, allowChats: ["oc_group", "oc_chat", "oc_x", "oc_real_chat", "oc_a", "oc_b", "oc_g", "oc_y", "oc_other", "oc_ok"], appId: "app", appSecret: "secret" },
 		sdk,
 		onMessage: async () => {},
 		onStatus: (state) => over.statuses?.push(state),

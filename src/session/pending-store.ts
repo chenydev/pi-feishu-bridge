@@ -12,8 +12,13 @@ export interface PendingRecord {
 	claimedAt: number;
 	leaseUntil: number;
 	attempts: number;
-	/** auto 允许重放纯推理 turn；manual 表示已越过工具边界，重放可能重复副作用。 */
-	replayPolicy?: "auto" | "manual";
+	/**
+	 * auto   重放（纯推理 turn，重放安全）
+	 * manual 越过工具边界，重放可能重复副作用 → 不重放，仅通知用户
+	 * never  命令类消息（/new、/stop 等）→ 不重放也不通知：重放会重复副作用
+	 *        （例如 /new 会再清一次上下文），而通知也没有意义（用户早知道结果）
+	 */
+	replayPolicy?: "auto" | "manual" | "never";
 	/** 最近一次状态变更时间（合并/刷新时更新）。 */
 	updatedAt?: number;
 	/** 本条记录覆盖的原始 sourceMessageId（batch 合并后为整个窗口）。 */
@@ -62,7 +67,10 @@ export class PendingStore {
 	/** 新进程可立即接管旧 owner；同进程仅接管 lease 已过期项。 */
 	recoverable(): PendingRecord[] {
 		const now = this.now();
-		const result = [...this.records.values()].filter((record) => record.owner !== this.owner || record.leaseUntil <= now);
+		// never 档（命令类消息）在账本层就排除：调用方不需要再判断一次，
+		// 也就不会出现"某个调用方忘了过滤 → 命令被重放"的隐患。
+		const result = [...this.records.values()].filter((record) =>
+			record.replayPolicy !== "never" && (record.owner !== this.owner || record.leaseUntil <= now));
 		for (const record of result) {
 			record.owner = this.owner;
 			record.claimedAt = now;
@@ -109,6 +117,14 @@ export class PendingStore {
 		primary.message = { ...merged, raw: undefined } as Omit<FeishuInboundMessage, "raw">;
 		primary.sourceMessageIds = [...sourceMessageIds];
 		primary.updatedAt = this.now();
+		this.persist();
+	}
+
+	/** 标记为永不重放（命令类消息）。 */
+	markNever(id: string): void {
+		const record = this.records.get(id);
+		if (!record || record.replayPolicy === "never") return;
+		record.replayPolicy = "never";
 		this.persist();
 	}
 

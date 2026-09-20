@@ -13,12 +13,14 @@ import { test } from "node:test";
 import { InboundPipeline, type IntakeLedger } from "../src/inbound/pipeline.js";
 import { DedupeStore } from "../src/inbound/dedupe-store.js";
 import { PendingStore } from "../src/session/pending-store.js";
+import { ConversationManager } from "../src/session/conversation-manager.js";
+import { buildConversationKey } from "../src/session/conversation-key.js";
 import { LastSentCache } from "../src/inbound/admit.js";
-import { DEFAULT_CONFIG, type BridgeConfig, type FeishuInboundMessage } from "../src/types.js";
+import { DEFAULT_CONFIG, type BridgeConfig, type FeishuInboundMessage, type SessionBackend } from "../src/types.js";
 import type { FeishuTransport } from "../src/inbound/transport.js";
 
 function cfg(over: Partial<BridgeConfig> = {}): BridgeConfig {
-	return { ...DEFAULT_CONFIG, ...over };
+	return { ...DEFAULT_CONFIG, allowChats: ["oc_group", "oc_chat", "oc_x", "oc_real_chat", "oc_a", "oc_b", "oc_g", "oc_y", "oc_other", "oc_ok"], ...over };
 }
 
 const NO_BATCH = { enabled: false, textWindowMs: 3000, maxMessages: 8, maxChars: 4_000 };
@@ -188,4 +190,91 @@ test("P0-01：未启用 intake 时保持原行为（命中即丢弃）", async (
 		assert.equal(second.getStats().duplicate, 1);
 		assert.equal(second.getStats().recovered, 0);
 	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------- 命令类消息不重放 ----
+// 对齐 hermes：重启恢复不重放原命令（hermes 用 recovery note 替换原文，
+// 桥的选择是直接跳过命令类消息 —— 重放 /new 会再清一次上下文）。
+
+test("命令类消息标为 never：重启后不重放（/new 不会被执行两次）", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pending-cmd-"));
+	const file = join(dir, "pending.jsonl");
+	const store = new PendingStore(file, { now: () => 1_000_000 });
+	const msg = {
+		messageId: "cmd-new-1", chatId: "oc_group", chatType: "group" as const,
+		senderId: "ou_user", isBot: false, msgType: "text" as const,
+		text: "/new", mentions: [], resources: [], raw: undefined, ts: 1,
+	};
+	store.claim(msg, "oc_group:u:ou_user");
+	store.markNever("cmd-new-1");
+
+	// 换一个 owner（模拟重启），可恢复项里不应再出现这条命令
+	const after = new PendingStore(file, { now: () => 2_000_000 });
+	const recoverable = after.recoverable();
+	assert.equal(recoverable.length, 0, "命令类消息不应出现在可重放集合中");
+});
+
+test("普通消息仍是 auto：重启后可重放（保证入站不丢）", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pending-cmd-"));
+	const file = join(dir, "pending.jsonl");
+	const store = new PendingStore(file, { now: () => 1_000_000 });
+	store.claim({
+		messageId: "normal-1", chatId: "oc_group", chatType: "group" as const,
+		senderId: "ou_user", isBot: false, msgType: "text" as const,
+		text: "帮我查下日志", mentions: [], resources: [], raw: undefined, ts: 1,
+	}, "oc_group:u:ou_user");
+
+	const after = new PendingStore(file, { now: () => 2_000_000 });
+	assert.equal(after.recoverable().length, 1, "普通消息应仍可重放");
+});
+
+// ------------------------------------------------- 恢复提示注入（对齐 hermes）----
+// hermes: "Do NOT re-execute old tool calls — skip any unfinished work from
+// the conversation history." 桥把它作为一次性方括号元信息注入到恢复后的
+// 第一条消息前 —— 用户看不到（不是飞书消息），但模型的行为会受约束。
+
+test("崩溃恢复后注入恢复提示：不改原文、且只注入一次", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "recovery-note-"));
+	const file = join(dir, "pending.jsonl");
+	const store = new PendingStore(file, { now: () => 1_000_000 });
+	const msg: FeishuInboundMessage = {
+		messageId: "recover-1", chatId: "oc_group", chatType: "group",
+		senderId: "ou_user", isBot: false, msgType: "text",
+		text: "继续刚才的任务", mentions: [], resources: [], raw: undefined, ts: 1,
+	};
+	// 必须用真实的 key 规则（groupSessionsPerUser 默认 false 时 key 就是裸 chatId），
+	// 手写 "oc_group:u:ou_user" 会和 runtime 算出的 key 不一致，导致注入匹配不上。
+	const key = buildConversationKey(msg, cfg());
+	store.claim(msg, key);
+	store.markManual("recover-1");   // 模拟"已越过工具边界"
+
+	const captured: string[] = [];
+	const backend: SessionBackend = {
+		async createSession() {
+			return {
+				sessionId: "sid-recovery", async prompt(t: string) { captured.push(t); return "ok"; },
+				subscribe() { return () => {}; }, async abort() {}, async dispose() {}, modelId: "m",
+			};
+		},
+	};
+	const manager = new ConversationManager({
+		config: cfg(), sessionDir: dir, sessionBackend: backend,
+		sender: { async send() { return { success: true }; }, async update() { return { success: true }; } } as never,
+		pendingFile: file,
+	});
+
+	// recoverPending 会为 manual 记录写通知 + 登记恢复提示
+	await manager.recoverPending();
+	// 再走一轮普通消息，触发提示注入
+	await manager.route({ ...msg, messageId: "recover-next" });
+	await new Promise((r) => setTimeout(r, 60));
+
+	const injected = captured.find((t) => t.includes("不要重新执行对话历史中未完成的工具调用"));
+	assert.ok(injected, "恢复后应有提示注入");
+	assert.match(injected, /继续刚才的任务/, "原消息文本必须保留在提示之后，不被替换");
+	// 只注入一次
+	captured.length = 0;
+	await manager.route({ ...msg, messageId: "recover-third" });
+	await new Promise((r) => setTimeout(r, 60));
+	assert.ok(!captured.some((t) => t.includes("不要重新执行")), "提示不应重复注入");
 });

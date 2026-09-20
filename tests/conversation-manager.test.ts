@@ -9,7 +9,7 @@ import { DEFAULT_CONFIG, type BridgeConfig, type FeishuInboundMessage, type Sess
 
 function config(over: Partial<BridgeConfig> = {}): BridgeConfig {
 	return {
-		...DEFAULT_CONFIG,
+		...DEFAULT_CONFIG, allowChats: ["oc_group", "oc_chat", "oc_x", "oc_real_chat", "oc_a", "oc_b", "oc_g", "oc_y", "oc_other", "oc_ok"],
 		reaction: { ...DEFAULT_CONFIG.reaction, enabled: false },
 		footer: { enabled: false, showCost: false },
 		...over,
@@ -276,7 +276,7 @@ test("会话控制：model/compact 透传公开 API，/new 使用新 session 文
 	const msg = message("control-1");
 	await manager.route(msg);
 	await waitUntil(() => sent.some((entry) => entry.text === "ok"));
-	assert.equal(await manager.modelConversation(msg), "当前模型：old");
+	assert.match(await manager.modelConversation(msg), /^当前模型：old/);
 	assert.equal(await manager.modelConversation(msg, "new"), "已切换模型：new");
 	assert.equal(await manager.compactConversation(msg, "keep facts"), "compact:keep facts");
 	await manager.resetConversation(msg);
@@ -301,7 +301,7 @@ test("首次使用 /model 会初始化会话并返回实际默认模型", async 
 	const manager = new ConversationManager({ config: config(), sessionDir: "/tmp/feishu-model-lazy", sessionBackend: backend, sender: sender(sent) as never });
 	const msg = message("model-lazy");
 
-	assert.equal(await manager.modelConversation(msg), "当前模型：deepseek-v4-flash");
+	assert.match(await manager.modelConversation(msg), /^当前模型：deepseek-v4-flash/);
 	assert.equal(created, 1);
 	await manager.route({ ...msg, messageId: "model-lazy-prompt" });
 	await waitUntil(() => sent.some((entry) => entry.text === "ok"));
@@ -813,4 +813,79 @@ test("恢复：越过工具边界的 pending 不重跑 Agent，durable 通知后
 		assert.equal(durable[0].kind, "error");
 		assert.equal(new PendingStore(pendingFile).depth(), 0);
 	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("/model 不带参数：展示当前模型 + 可用候选 + 切换语法（对齐 hermes）", async () => {
+	const backend: SessionBackend = {
+		async createSession() {
+			return {
+				sessionId: "sid-model-list", async prompt() { return "ok"; }, subscribe() { return () => {}; },
+				async abort() {}, async dispose() {}, modelId: "deepseek-flash",
+				async setModel() { return true; },
+				async listModels() {
+					return [
+						{ id: "deepseek-flash", provider: "deepseek" },
+						{ id: "deepseek-v4-pro", provider: "deepseek" },
+						{ id: "gpt-5.6-luna", provider: "openai" },
+					];
+				},
+				thinkingLevel() { return "high"; },
+			};
+		},
+	};
+	const sent: Array<{ chatId: string; text: string }> = [];
+	const manager = new ConversationManager({ config: config(), sessionDir: "/tmp/feishu-model-list", sessionBackend: backend, sender: sender(sent) as never });
+	const out = await manager.modelConversation(message("model-list"));
+
+	// 当前模型 + 思考等级
+	assert.match(out, /^当前模型：deepseek-flash/);
+	assert.match(out, /思考等级：high/);
+	// 候选带 provider 前缀，且不重复当前模型
+	assert.match(out, /deepseek\/deepseek-v4-pro/);
+	assert.match(out, /openai\/gpt-5\.6-luna/);
+	assert.ok(!out.includes("· deepseek/deepseek-flash"), "当前模型不应出现在可切换列表里");
+	// 明确给出切换语法与相关命令
+	assert.match(out, /切换：\/model <模型>/);
+	assert.match(out, /\/models/);
+	assert.match(out, /\/thinking/);
+});
+
+test("/model 无 listModels 能力（老 pi）时仍返回当前模型，不报错", async () => {
+	const backend: SessionBackend = {
+		async createSession() {
+			return {
+				sessionId: "sid-no-list", async prompt() { return "ok"; }, subscribe() { return () => {}; },
+				async abort() {}, async dispose() {}, modelId: "legacy-model",
+				async setModel() { return true; },
+			};
+		},
+	};
+	const manager = new ConversationManager({
+		config: config(), sessionDir: "/tmp/feishu-model-nolist",
+		sessionBackend: backend, sender: sender([]) as never,
+	});
+	const out = await manager.modelConversation(message("model-nolist"));
+	assert.match(out, /^当前模型：legacy-model/);
+	assert.match(out, /切换：\/model <模型>/);
+});
+
+test("/model 候选超过上限时截断并提示其余数量", async () => {
+	const many = Array.from({ length: 15 }, (_, i) => ({ id: `m${i}`, provider: "p" }));
+	const backend: SessionBackend = {
+		async createSession() {
+			return {
+				sessionId: "sid-many", async prompt() { return "ok"; }, subscribe() { return () => {}; },
+				async abort() {}, async dispose() {}, modelId: "m0",
+				async setModel() { return true; },
+				async listModels() { return many; },
+			};
+		},
+	};
+	const manager = new ConversationManager({
+		config: config(), sessionDir: "/tmp/feishu-model-many",
+		sessionBackend: backend, sender: sender([]) as never,
+	});
+	const out = await manager.modelConversation(message("model-many"));
+	assert.match(out, /可切换（14）/);
+	assert.match(out, /其余 4 个/);
 });

@@ -28,8 +28,8 @@ const markdownsOf = (card: CardShape) =>
 
 test("审批卡：彩色 header + 4 个满宽按钮（纵向一列）", () => {
 	const card = buildApprovalCard(pending()) as CardShape;
-	assert.equal(card.header?.title?.content, "工具审批", "顶部应有标题栏");
-	assert.equal(card.header?.template, "blue", "待审批用蓝色 header");
+	assert.equal(card.header?.title?.content, "⚠️ 需要审批", "顶部应有标题栏（带警示符号）");
+	assert.equal(card.header?.template, "orange", "待审批用橙色 header（警示色，参考 hermes）");
 	assert.equal(card.header?.subtitle, undefined, "待审批不显示结论副标题");
 
 	const buttons = buttonsOf(card);
@@ -43,6 +43,7 @@ test("审批卡：彩色 header + 4 个满宽按钮（纵向一列）", () => {
 	// 顺序与语义：批准三档在前、拒绝在最后，拒绝必须是 danger
 	assert.deepEqual(buttons.map((b) => (b.value as { choice: string }).choice), ["once", "session", "always", "deny"]);
 	assert.equal(buttons[0]!.type, "primary", "「仅本次批准」为强调色");
+	assert.match((buttons[0]!.text as { content: string }).content, /^✅ /, "按钮文案带 emoji");
 	assert.equal(buttons[3]!.type, "danger", "「拒绝」为危险色");
 
 	// 回调 op 必须是 approval，且带 approvalId + token
@@ -56,14 +57,15 @@ test("审批卡：彩色 header + 4 个满宽按钮（纵向一列）", () => {
 	assert.ok(markdownsOf(card).some((t) => t.startsWith("```") && t.includes("ls -la")), "命令应包在代码块里");
 });
 
-test("审批卡：超长参数截断到 500 字符", () => {
+test("审批卡：超长参数按命令预算（3000）截断", () => {
 	const long = pending();
-	long.paramsText = "x".repeat(2000);
+	long.paramsText = "x".repeat(5000);
 	const card = buildApprovalCard(long) as CardShape;
 	const block = markdownsOf(card).find((t) => t.startsWith("```")) ?? "";
-	assert.ok(block.length < 700, `参数应被截断，实际 ${block.length}`);
-	assert.ok(block.includes("x".repeat(500)), "应保留前 500 字符");
-	assert.ok(!block.includes("x".repeat(501)), "不应出现第 501 个字符");
+	// 命令预算 3000（参考 hermes 的 _EA_CMD_BUDGET）；代码块自身有若干字符开销
+	assert.ok(block.length < 3100, `参数应被截断到约 3000，实际 ${block.length}`);
+	assert.ok(block.includes("x".repeat(3000)), "应保留前 3000 字符");
+	assert.ok(!block.includes("x".repeat(3001)), "不应出现第 3001 个字符");
 });
 
 /** 已处理状态的卡片结构（复用同一渲染函数）。 */
@@ -176,4 +178,19 @@ test("终态不能靠 choice 猜测配色：显式 terminal 优先", () => {
 	assert.equal(denied.header?.template, "red");
 	const approved = buildApprovalCard(pending(), { choice: "once", resultText: "已批准", operatorOpenId: "ou_x", terminal: "approved" }) as CardShape;
 	assert.equal(approved.header?.template, "green");
+});
+
+test("转发审批卡：只渲染被允许的选项（不给做不到的按钮）", () => {
+	// PS 转发路径无法把「始终批准」写进对方策略引擎的配置，所以那张卡不该出现该按钮。
+	const p = pending();
+	p.choices = ["once", "session", "deny"];
+	const card = buildApprovalCard(p) as CardShape;
+	const buttons = buttonsOf(card);
+	assert.deepEqual(buttons.map((b) => (b.value as { choice: string }).choice), ["once", "session", "deny"]);
+	assert.equal(buttons[0]!.type, "primary");
+	assert.equal(buttons[2]!.type, "danger");
+
+	const resolved = buildApprovalCard(p, { choice: "session", resultText: "已批准", operatorOpenId: "ou_owner" }) as CardShape;
+	assert.equal(buttonsOf(resolved).length, 3, "已处理态沿用同一选项集合");
+	assert.ok(String((buttonsOf(resolved)[1]!.text as { content: string }).content).startsWith("✓"));
 });
