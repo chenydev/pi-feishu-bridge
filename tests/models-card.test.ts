@@ -234,13 +234,33 @@ test("状态卡：THINKING_LEVELS_PER_ROW 是 3，且列宽全部用 weighted（
 // 点按钮只是代用户发一条命令；把命令露出来，用户才能复制去加 -g、
 // 转发给别人、或记到自己的笔记里。
 
-test("状态卡：档位按钮下方列出等价命令，且能被复制（反引号包起来）", () => {
+test("状态卡：首屏不罗列全部命令（那是「已执行」的职责，静态列一遍只是噪音）", () => {
 	const card = buildModelStatusCard({
 		currentLabel: "m", thinkingLevel: "max", availableLevels: ["high", "max"], conversationKey: "k",
 	}) as StatusCard;
+	assert.doesNotMatch(JSON.stringify(card), /`\/thinking high`/, "没点过任何按钮就不该有已执行回执");
+});
+
+test("状态卡：「已执行」区块显示刚跑的命令，位置在底部小字上面", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high", "max"],
+		conversationKey: "k", lastExecuted: "/thinking high",
+	}) as StatusCard;
 	const all = JSON.stringify(card);
-	assert.match(all, /`\/thinking high`/, "要给出 /thinking high 这条命令");
-	assert.match(all, /`\/thinking max`/);
+	assert.match(all, /已执行/, "要有已执行回执");
+	assert.match(all, /`\/thinking high`/, "命令要被反引号包起来，方便选中复制");
+
+	// 顺序：已执行 必须出现在 -g 提示之前（用户要求"在小字上面"）
+	const idxExec = all.indexOf("已执行");
+	const idxTip = all.indexOf("-g");
+	assert.ok(idxExec > 0 && idxTip > 0 && idxExec < idxTip, `已执行(${idxExec}) 应在 -g 提示(${idxTip}) 之前`);
+});
+
+test("状态卡：没有 lastExecuted 时不出现已执行区块", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high"], conversationKey: "k",
+	}) as StatusCard;
+	assert.doesNotMatch(JSON.stringify(card), /已执行/);
 });
 
 test("状态卡：底部小字提示 -g 可设为全局默认", () => {
@@ -258,10 +278,12 @@ test("状态卡：底部小字提示 -g 可设为全局默认", () => {
 	assert.match(tip, /新建|之后/, "必须说明只对新会话生效");
 });
 
-test("状态卡：提示用 notation 小字号，不与正文抢注意力", () => {
+test("状态卡：底部 -g 提示用小字号，不与正文抢注意力", () => {
 	const card = buildModelStatusCard({
 		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high"], conversationKey: "k",
 	}) as StatusCard;
-	const notation = card.body.elements.filter((e) => e.text_size === "notation");
-	assert.ok(notation.length >= 2, "命令提示与底部小字都该是小字号");
+	const tip = card.body.elements.find(
+		(e) => e.tag === "markdown" && String((e as { content?: string }).content ?? "").includes("-g"),
+	) as { text_size?: string } | undefined;
+	assert.equal(tip?.text_size, "notation", "提示内容字号要和正文区分开");
 });

@@ -96,6 +96,13 @@ export interface ModelStatusInput {
 	availableLevels?: string[];
 	/** 回调时用于定位会话（卡片发到哪个会话，就带哪个 key）。 */
 	conversationKey: string;
+	/**
+	 * 刚刚通过这张卡片执行的命令（如 `/thinking high`）。
+	 *
+	 * 卡片按钮是黑盒：点完只知道"变了"，不知道背后跑了什么。把刚执行的命令写出来，
+	 * 用户才能复制它去加 `-g`、转发给别人、或记进笔记。只有回调触发的重渲染才带它。
+	 */
+	lastExecuted?: string;
 }
 
 /** 两列 key-value（column_set）：标签与值严格左对齐，比全角空格排版可靠。 */
@@ -190,13 +197,7 @@ export function buildModelStatusCard(input: ModelStatusInput): unknown {
 					tag: "column_set", flex_mode: "none", horizontal_spacing: "small", columns,
 				});
 			}
-			// 把按钮等价的命令写出来：点按钮只是"代你发一条命令"，把命令露出来
-			// 用户才能复制它去加 -g、转发给别人、或写进自己的笔记。
-			elements.push({
-				tag: "markdown",
-				content: `　　${levels.map((level) => "`/thinking " + level + "`").join("　")}`,
-				text_size: "notation",
-			});
+
 		} else {
 			// 模型不支持推理时不显示空按钮组 —— 一张空的按钮行比没有更让人困惑
 			elements.push(kvRow("思考等级", `${input.thinkingLevel}（当前模型无可用档位）`));
@@ -224,6 +225,11 @@ export function buildModelStatusCard(input: ModelStatusInput): unknown {
 		],
 	});
 	elements.push(kvRow("切换模型", "`/model <provider>/<模型>`"));
+	// 「已执行」区块：放在底部小字**上面**，紧接着说这次点的是什么命令。
+	// 用引用块（blockquote）区分于正文，一眼能看出是"回执"而不是"设置项"。
+	if (input.lastExecuted) {
+		elements.push({ tag: "markdown", content: `> **已执行**：\`${input.lastExecuted}\`` });
+	}
 	elements.push({ tag: "hr" });
 	// 底部小字：把「怎么把改动变成全局默认」写在入口旁边 —— 否则这个能力
 	// 只有读过文档的人知道，而卡片是绝大多数人唯一的入口。

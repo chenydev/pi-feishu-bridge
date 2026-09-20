@@ -186,9 +186,11 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			log.info("feishu.card.thinking_set", { level: value.level, conversationKey: value.conversationKey });
 			const data = await convManager?.modelStatusCardDataByKey(value.conversationKey);
 			if (!data) return { toast: { type: "success", content: `已切换到 ${value.level}` } };
+			// 把这次执行的命令写进卡片：用户点的是按钮，但等价于发了一条斜杠命令，
+			// 露出来才能复制去加 -g（全局默认）或转发给别人。
 			return {
 				toast: { type: "success", content: `已切换到 ${value.level}` },
-				card: { type: "raw", data: buildModelStatusCard(data) },
+				card: { type: "raw", data: buildModelStatusCard({ ...data, lastExecuted: `/thinking ${value.level}` }) },
 			};
 		}
 
