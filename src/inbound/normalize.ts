@@ -232,14 +232,20 @@ export function resolveMentionPlaceholders(text: string, mentions: FeishuMention
 
 /** 剥离开头的自身 mention 占位（@_user_xxx）与 @name 前缀。 */
 export function stripEdgeSelfMentions(text: string, mentions: FeishuMentionRef[]): string {
-	let out = text;
+	// **先去掉前导空白再匹配**：下面的正则都锚在行首（^@...），而飞书送来的文本
+	// 常常以空白开头（用户在 @ 前敲了空格、或客户端插了不可见前导字符）。
+	// 不 trim 的话一个都匹配不上，mention 会留在文本里 → 这条消息**不再被识别为
+	// 命令**（`normalized` 变成 "@机器人名"），于是命令被当成普通问题丢给模型，
+	// 模型看不懂就去执行 env / ls 之类"探索环境"的命令 —— 表现成「发命令却弹审批」。
+	let out = text.replace(/^\s+/, "");
 	const selfNames = mentions.filter((m) => m.isSelf && m.name).map((m) => m.name as string);
 	for (const name of selfNames) {
 		// 最长优先，避免部分匹配
 		const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 		out = out.replace(new RegExp(`^@${escaped}\\s*`), "").replace(new RegExp(`^@${escaped}(?=\\s|$)`), "");
 	}
-	out = out.replace(/^@_user_\w+\s*/g, "").trim();
+	// 占位符形式（@_user_1）同样用 \s* 兜住前导空白
+	out = out.replace(/^\s*@_user_\w+\s*/g, "").trim();
 	return out;
 }
 

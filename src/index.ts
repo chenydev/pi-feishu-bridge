@@ -36,6 +36,7 @@ import {
 import { classifyCommand } from "./approval/command-policy.js";
 import { buildApprovalCard, type ApprovalCardResolution } from "./approval/cards.js";
 import { buildModelStatusCard, buildModelsTable } from "./commands/models-card.js";
+import { readGlobalDefaults, splitModelTarget, writeGlobalDefaults } from "./config/global-defaults.js";
 import {
 	ClarificationStore,
 	buildClarificationCard,
@@ -157,6 +158,11 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 				log.error("status write failed", { error: error instanceof Error ? error.message : String(error) });
 			}
 		}
+	}
+
+	/** 管理员/应用归属人判定（统一走 effectiveAdmins，避免换应用后视角失效）。 */
+	function isAdminSender(msg: { senderId: string }): boolean {
+		return effectiveAdmins(config).includes(msg.senderId);
 	}
 
 	async function handleCardAction(action: CardAction): Promise<unknown> {
@@ -359,7 +365,23 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 					return true;
 				}
 			}
-			reply(await convManager?.modelConversation(msg, args[0]) ?? "会话不可用");
+			const raw = args.join(" ").trim();
+			const wantsGlobal = /(^|\s)(--global|-g)(\s|$)/.test(raw);
+			const target = raw.replace(/(^|\s)(--global|-g)(\s|$)/g, " ").trim();
+			const result = await convManager?.modelConversation(msg, target || undefined) ?? "会话不可用";
+			if (!wantsGlobal || !target) { reply(result); return true; }
+			if (!isAdminSender(msg)) { reply(`${result}\n（--global/-g 需要管理员或应用归属人）`); return true; }
+			const { model, provider } = splitModelTarget(target);
+			const written = writeGlobalDefaults(homeDir, {
+				defaultModel: model, ...(provider ? { defaultProvider: provider } : {}),
+			});
+			reply(written.ok
+				? `${result}\n已设为全局默认：新建会话的模型 = ${target}`
+				: `${result}\n⚠️ 全局默认写入失败：${written.reason}`);
+			log.info("feishu.global_default.written", {
+				kind: "model", value: target, ok: written.ok, operator: msg.senderId,
+				reason: written.reason ?? null,
+			});
 			return true;
 		}
 		if (normalized === "/models") {
@@ -395,7 +417,23 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			return true;
 		}
 		if (normalized === "/thinking") {
-			reply(await convManager?.thinkingConversation(msg, args[0]) ?? "会话不可用");
+			const raw = args.join(" ").trim();
+			// `--global` 任意位置都算（对齐 hermes 的 /reasoning 解析），
+			// 去掉它之后剩下的才是等级值 —— 否则 "--global" 会被当成一个档位名。
+			const wantsGlobal = /(^|\s)(--global|-g)(\s|$)/.test(raw);
+			const level = raw.replace(/(^|\s)(--global|-g)(\s|$)/g, " ").trim();
+			const result = await convManager?.thinkingConversation(msg, level || undefined) ?? "会话不可用";
+			if (!wantsGlobal || !level) { reply(result); return true; }
+			// 改全局默认 = 影响所有人 → 限管理员/归属人（与会话级改动不同）
+			if (!isAdminSender(msg)) { reply(`${result}\n（--global/-g 需要管理员或应用归属人）`); return true; }
+			const written = writeGlobalDefaults(homeDir, { defaultThinkingLevel: level });
+			reply(written.ok
+				? `${result}\n已设为全局默认：新建会话的思考等级 = ${level}`
+				: `${result}\n⚠️ 全局默认写入失败：${written.reason}`);
+			log.info("feishu.global_default.written", {
+				kind: "thinkingLevel", value: level, ok: written.ok,
+				operator: msg.senderId, reason: written.reason ?? null,
+			});
 			return true;
 		}
 		return false;

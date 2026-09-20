@@ -180,3 +180,30 @@ test("mention 占位符 → 真实名（hermes _render_post_element 对齐）", 
 	const { renderTextElement } = await import("../src/inbound/normalize.js");
 	assert.equal(renderTextElement({ tag: "at", user_id: "@_user_2" }), "@_user_2");
 });
+
+// ── 前导空白导致的「命令失效」回归（本轮真 bug）──────────────────────────
+// 现象：用户在群里发 `/thinking high --global`，桥却弹了审批。
+// 根因：飞书送来的文本以空白开头（用户在 @ 前敲了空格），而剥离 mention 的正则
+// 锚在行首 —— 匹配不上 → mention 留在文本里 → 这条消息不再被识别为命令
+// （normalized 变成 "@机器人名"）→ 命令被当成普通问题丢给模型 → 模型执行 env 探索。
+
+test("stripEdgeSelfMentions：前导空白不该让剥离失效（@_user_N 形式）", () => {
+	const withSpace = stripEdgeSelfMentions(" @_user_1 /thinking high --global", [{ isSelf: true, name: "小助手" }]);
+	assert.equal(withSpace, "/thinking high --global", "有前导空格也必须剥干净，否则命令识别不了");
+	const noSpace = stripEdgeSelfMentions("@_user_1 /thinking high --global", [{ isSelf: true, name: "小助手" }]);
+	assert.equal(noSpace, "/thinking high --global");
+});
+
+test("stripEdgeSelfMentions：前导空白 + 按名字剥离也要生效", () => {
+	const refs = [{ isSelf: true, name: "CY智能助手" }];
+	assert.equal(stripEdgeSelfMentions("  @CY智能助手 /models", refs), "/models");
+	assert.equal(stripEdgeSelfMentions("@CY智能助手 /models", refs), "/models");
+});
+
+test("剥离后必须能通过命令判定（trim 后以 / 开头）", () => {
+	const refs = [{ isSelf: true, name: "小助手" }];
+	for (const raw of [" @_user_1 /model -g", " @_user_1 /thinking", "\t@_user_1 /stop"]) {
+		const stripped = stripEdgeSelfMentions(raw, refs);
+		assert.ok(stripped.startsWith("/"), `剥离后应以 / 开头，实际=${JSON.stringify(stripped)}`);
+	}
+});
