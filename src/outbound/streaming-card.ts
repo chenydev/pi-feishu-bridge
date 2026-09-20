@@ -17,6 +17,8 @@
 import { randomUUID } from "node:crypto";
 
 export const STREAM_ELEMENT_ID = "stream";
+/** 页脚（本轮/会话指标）独立元素：与正文分开，飞书侧就是单独一块。 */
+export const METRICS_ELEMENT_ID = "metrics";
 
 export interface StreamingCardDeps {
 	rawRequest: (opts: { url: string; method: string; params?: unknown; data?: unknown }) => Promise<unknown>;
@@ -55,6 +57,8 @@ export class StreamingCard {
 	private totalWriteMs = 0;
 	private writeCount = 0;
 	private finished = false;
+	/** 是否声明了页脚元素（false 时 finish 的 metrics 走正文拼接）。 */
+	private withMetrics = true;
 	private readonly throttleMs: number;
 	private readonly printFrequencyMs: number;
 	private readonly printStep: number;
@@ -80,8 +84,9 @@ export class StreamingCard {
 	get sentMessageId(): string | undefined { return this.messageId; }
 
 	/** 创建卡片实体并作为回复发出；任一步失败返回 false（调用方应降级到文本通道）。 */
-	async start(target: StreamingCardTarget, initialText = "正在处理…"): Promise<boolean> {
+	async start(target: StreamingCardTarget, initialText = "正在处理…", options?: { withMetrics?: boolean }): Promise<boolean> {
 		this.target = target;
+		this.withMetrics = options?.withMetrics ?? true;
 		try {
 			const created = await this.deps.rawRequest({
 				url: "/open-apis/cardkit/v1/cards",
@@ -143,8 +148,15 @@ export class StreamingCard {
 		this.timer.unref?.();
 	}
 
-	/** 收尾：写入最终正文并停止更新。返回是否成功（失败则由调用方按文本通道兜底）。 */
-	async finish(finalText: string): Promise<boolean> {
+	/**
+	 * 收尾：写入最终正文（+ 可选的页脚块）并停止更新。返回是否成功（失败则由调用方按文本通道兜底）。
+	 *
+	 * 页脚走**独立元素**（`metrics`）而不是拼在正文后面：
+	 * - 它属于元信息而非答案，拼在正文里会被当成回答的最后一段读；
+	 * - 独立元素能单独设 `text_size: notation`（小号淡色），视觉上自然分层。
+	 * 页脚元素写失败时降级成旧行为（拼在正文末尾），不让元信息丢失拖垮交付。
+	 */
+	async finish(finalText: string, options?: { metrics?: string }): Promise<boolean> {
 		if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
 		if (!this.available) { this.finished = true; return false; }
 		// 标记收尾：后续写入以传入文本为准，不再合并 pendingText
@@ -152,7 +164,18 @@ export class StreamingCard {
 		this.pendingText = undefined;
 		if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
 		// writeChain 保证最终内容一定排在所有在途写入之后落地
-		const ok = await this.flushText(finalText);
+		let ok = await this.flushText(finalText);
+		const metrics = options?.metrics?.trim();
+		let metricsFallback = false;
+		if (ok && metrics) {
+			// 声明了页脚元素就走独立块；没声明（footer 关闭）或写失败则拼在正文末尾 ——
+			// 元信息可以换位置，但不能静默丢掉。
+			if (this.withMetrics) ok = await this.writeMetrics(metrics);
+			if (!ok || !this.withMetrics) {
+				metricsFallback = true;
+				ok = await this.flushText(`${finalText}\n\n${metrics}`);
+			}
+		}
 		this.finished = true;
 		// 汇总可用于判断"吐字"流畅度：写入次数 / 内容长度 / 实际节流
 		this.deps.log?.(ok ? "info" : "warn", "feishu.stream_card.finished", {
@@ -160,12 +183,40 @@ export class StreamingCard {
 			ok,
 			writes: this.sequence,
 			contentLen: finalText.length,
+			metricsLen: metrics?.length ?? 0,
+			metricsFallback,
 			throttleMs: this.throttleMs,
 			elapsedMs: this.now() - this.startedAt,
 			apiTotalMs: this.totalWriteMs,
 			apiAvgMs: this.writeCount > 0 ? Math.round(this.totalWriteMs / this.writeCount) : 0,
 		});
 		return ok;
+	}
+
+	/** 写页脚元素（独立块）。失败返回 false，由调用方降级。 */
+	private async writeMetrics(text: string): Promise<boolean> {
+		if (!this.cardId || this.withMetrics === false) return false;
+		const writeStart = this.now();
+		try {
+			this.sequence += 1;
+			await this.deps.rawRequest({
+				url: `/open-apis/cardkit/v1/cards/${this.cardId}/elements/${METRICS_ELEMENT_ID}/content`,
+				method: "PUT",
+				data: { content: text.slice(0, this.maxChars), sequence: this.sequence, uuid: randomUUID() },
+			});
+			this.lastFlushAt = this.now();
+			this.totalWriteMs += this.lastFlushAt - writeStart;
+			this.writeCount += 1;
+			return true;
+		} catch (error) {
+			this.deps.log?.("warn", "feishu.stream_card.metrics_failed", {
+				cardId: this.cardId,
+				error: error instanceof Error ? error.message : String(error),
+				detail: extractErrorDetail(error),
+				sequence: this.sequence,
+			});
+			return false;
+		}
 	}
 
 	/** 放弃卡片（run 失败/中止）：尽量写一句状态，之后不再更新。 */
@@ -265,6 +316,14 @@ export class StreamingCard {
 			body: {
 				elements: [
 					{ tag: "markdown", element_id: STREAM_ELEMENT_ID, content: text },
+					// 页脚块：分割线 + 独立 markdown 元素。创建时留空（空 markdown 不占视觉空间），
+					// 收尾时再用 /content 写入 —— 飞书卡片元素必须在建卡时就存在。
+					...(this.withMetrics
+						? [
+							{ tag: "hr" },
+							{ tag: "markdown", element_id: METRICS_ELEMENT_ID, text_size: "notation", content: "" },
+						]
+						: []),
 				],
 			},
 		};

@@ -15,8 +15,28 @@ export interface AdaptedUsage {
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
-	/** 按模型配置估算的费用；缺失表示"未知"，不得当作 0。 */
+	/**
+	 * 按模型配置估算的费用（归一为总金额）；缺失表示"未知"，不得当作 0。
+	 *
+	 * Pi 的 `Usage.cost` 是 `{ input, output, cacheRead, cacheWrite, total }` **对象**
+	 * （`@earendil-works/pi-ai/dist/types.d.ts` 的 Usage），不是数字 —— 早期版本按数字读，
+	 * `typeof obj === "number"` 恒为 false，导致页脚永远显示"费用未知"。
+	 */
 	cost?: number;
+}
+
+const COST_KEYS = ["input", "output", "cacheRead", "cacheWrite"] as const;
+
+/** 把 Pi 的 `usage.cost`（对象，取 total）归一为数字；兼容历史/扩展的数字形状。 */
+function costFrom(value: unknown): number | undefined {
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+	if (!value || typeof value !== "object") return undefined;
+	const cost = value as Record<string, unknown>;
+	if (typeof cost.total === "number" && Number.isFinite(cost.total)) return cost.total;
+	// 没有 total 的 provider（自定义扩展）回退到分项求和；任一分项非数字则视为未知。
+	const parts = COST_KEYS.map((key) => cost[key]);
+	if (parts.some((part) => typeof part !== "number" || !Number.isFinite(part))) return undefined;
+	return (parts as number[]).reduce((sum, part) => sum + part, 0);
 }
 
 function usageFrom(value: unknown): AdaptedUsage | undefined {
@@ -27,7 +47,8 @@ function usageFrom(value: unknown): AdaptedUsage | undefined {
 		input: num("input"), output: num("output"),
 		cacheRead: num("cacheRead"), cacheWrite: num("cacheWrite"),
 	};
-	if (typeof usage.cost === "number" && Number.isFinite(usage.cost)) parsed.cost = usage.cost;
+	const cost = costFrom(usage.cost);
+	if (cost !== undefined) parsed.cost = cost;
 	return parsed;
 }
 

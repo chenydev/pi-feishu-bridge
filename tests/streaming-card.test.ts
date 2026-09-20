@@ -262,3 +262,52 @@ test("收尾文本优先：更短的 final 不会被更长的 pending 覆盖", a
 	const last = updates.at(-1)!.data as { content: string };
 	assert.equal(last.content, "最终答案很短", "final 必须原样落地，不能被更长的 pending 顶掉");
 });
+
+test("流式卡片：页脚走独立元素（分割线 + notation 块），正文不含页脚", async () => {
+	const { calls, request } = recorder();
+	const card = new StreamingCard({ rawRequest: request, throttleMs: 0, now: () => 1_000 });
+	await card.start({ chatId: "oc_x", replyTo: "om_src" }, "处理中…");
+
+	const payload = JSON.parse(String((calls[0]!.data as { data: string }).data));
+	const ids = payload.body.elements.map((e: { element_id?: string }) => e.element_id);
+	assert.deepEqual(ids, ["stream", undefined, "metrics"], "元素顺序：正文 → 分割线 → 页脚");
+	assert.equal(payload.body.elements[2].element_id, "metrics");
+	assert.equal(payload.body.elements[2].text_size, "notation", "页脚用小号字（元信息不抢正文）");
+	assert.equal(payload.body.elements[1].tag, "hr");
+
+	const ok = await card.finish("最终答案", { metrics: "本轮 deepseek-flash · 1.8s · <$0.01（估算）" });
+	assert.equal(ok, true);
+	// 正文元素只写正文：页脚不粘在答案尾部
+	const bodyWrites = calls.filter((c) => c.url.endsWith("/elements/stream/content"));
+	assert.equal(String((bodyWrites.at(-1)!.data as { content: string }).content), "最终答案");
+	const metricsWrites = calls.filter((c) => c.url.endsWith("/elements/metrics/content"));
+	assert.equal(metricsWrites.length, 1);
+	assert.equal(String((metricsWrites[0]!.data as { content: string }).content).includes("本轮 deepseek-flash"), true);
+	// sequence 必须递增（平台要求，乱序会渲染成空白卡片）
+	const seqs = [bodyWrites.at(-1), metricsWrites[0]].map((c) => (c!.data as { sequence: number }).sequence);
+	assert.ok(seqs[1]! > seqs[0]!, `sequence 必须递增：${seqs.join(",")}`);
+});
+
+test("流式卡片：页脚元素写失败时降级为拼在正文末尾（元信息不丢）", async () => {
+	const { calls, request } = recorder((url) => url.endsWith("/elements/metrics/content"));
+	const card = new StreamingCard({ rawRequest: request, throttleMs: 0, now: () => 1_000 });
+	await card.start({ chatId: "oc_x", replyTo: "om_src" });
+	const ok = await card.finish("最终答案", { metrics: "本轮 页脚" });
+	assert.equal(ok, true, "页脚写失败不该让整轮交付失败");
+	const bodyWrites = calls.filter((c) => c.url.endsWith("/elements/stream/content"));
+	assert.equal(String((bodyWrites.at(-1)!.data as { content: string }).content), "最终答案\n\n本轮 页脚");
+});
+
+test("流式卡片：未声明页脚元素时（footer 关闭）不写 metrics", async () => {
+	const { calls, request } = recorder();
+	const card = new StreamingCard({ rawRequest: request, throttleMs: 0, now: () => 1_000 });
+	await card.start({ chatId: "oc_x", replyTo: "om_src" }, "处理中…", { withMetrics: false });
+	const payload = JSON.parse(String((calls[0]!.data as { data: string }).data));
+	assert.equal(payload.body.elements.length, 1, "不声明页脚元素");
+	const ok = await card.finish("最终答案", { metrics: "本轮 页脚" });
+	assert.equal(ok, true);
+	assert.equal(calls.filter((c) => c.url.includes("/elements/metrics/content")).length, 0);
+	// 仍然不丢页脚：拼在正文末尾
+	const bodyWrites = calls.filter((c) => c.url.endsWith("/elements/stream/content"));
+	assert.equal(String((bodyWrites.at(-1)!.data as { content: string }).content), "最终答案\n\n本轮 页脚");
+});
