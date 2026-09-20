@@ -190,6 +190,13 @@ export function buildModelStatusCard(input: ModelStatusInput): unknown {
 					tag: "column_set", flex_mode: "none", horizontal_spacing: "small", columns,
 				});
 			}
+			// 把按钮等价的命令写出来：点按钮只是"代你发一条命令"，把命令露出来
+			// 用户才能复制它去加 -g、转发给别人、或写进自己的笔记。
+			elements.push({
+				tag: "markdown",
+				content: `　　${levels.map((level) => "`/thinking " + level + "`").join("　")}`,
+				text_size: "notation",
+			});
 		} else {
 			// 模型不支持推理时不显示空按钮组 —— 一张空的按钮行比没有更让人困惑
 			elements.push(kvRow("思考等级", `${input.thinkingLevel}（当前模型无可用档位）`));
@@ -217,6 +224,15 @@ export function buildModelStatusCard(input: ModelStatusInput): unknown {
 		],
 	});
 	elements.push(kvRow("切换模型", "`/model <provider>/<模型>`"));
+	elements.push({ tag: "hr" });
+	// 底部小字：把「怎么把改动变成全局默认」写在入口旁边 —— 否则这个能力
+	// 只有读过文档的人知道，而卡片是绝大多数人唯一的入口。
+	elements.push({
+		tag: "markdown",
+		text_size: "notation",
+		content: "以上操作都等价于对应的斜杠命令。**加 `-g`（或 `--global`）可设为全局默认**，"
+			+ "对**之后新建的**会话生效（当前会话不受影响）。",
+	});
 
 	return {
 		schema: "2.0",

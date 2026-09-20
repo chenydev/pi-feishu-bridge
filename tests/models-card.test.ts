@@ -229,3 +229,39 @@ test("状态卡：THINKING_LEVELS_PER_ROW 是 3，且列宽全部用 weighted（
 		}
 	}
 });
+
+// ── 把「按钮等价于哪条命令」写在卡片上 ─────────────────────────────────
+// 点按钮只是代用户发一条命令；把命令露出来，用户才能复制去加 -g、
+// 转发给别人、或记到自己的笔记里。
+
+test("状态卡：档位按钮下方列出等价命令，且能被复制（反引号包起来）", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "max", availableLevels: ["high", "max"], conversationKey: "k",
+	}) as StatusCard;
+	const all = JSON.stringify(card);
+	assert.match(all, /`\/thinking high`/, "要给出 /thinking high 这条命令");
+	assert.match(all, /`\/thinking max`/);
+});
+
+test("状态卡：底部小字提示 -g 可设为全局默认", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high"], conversationKey: "k",
+	}) as StatusCard;
+	const texts = card.body.elements
+		.filter((e) => e.tag === "markdown")
+		.map((e) => String((e as { content?: string }).content ?? ""));
+	const tip = texts.find((t) => t.includes("-g")) ?? "";
+	assert.match(tip, /-g/, "必须提到 -g 简写");
+	assert.match(tip, /--global/, "也要提到完整写法");
+	assert.match(tip, /全局默认/, "要说清它是干什么的");
+	// 关键：要说明生效范围，否则用户会以为当前会话也变了
+	assert.match(tip, /新建|之后/, "必须说明只对新会话生效");
+});
+
+test("状态卡：提示用 notation 小字号，不与正文抢注意力", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high"], conversationKey: "k",
+	}) as StatusCard;
+	const notation = card.body.elements.filter((e) => e.text_size === "notation");
+	assert.ok(notation.length >= 2, "命令提示与底部小字都该是小字号");
+});
