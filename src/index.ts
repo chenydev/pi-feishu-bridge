@@ -194,23 +194,19 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			};
 		}
 
-		// /model 状态卡的「查看全部模型」：等价于执行 /models —— **发一张新卡片**
-		// 而不是原地替换，那样会把状态卡覆盖掉，用户就失去了回到档位按钮的入口。
-		if (value.op === "models.open") {
+		// /model 状态卡的模型表格：**在同一张卡里展开/收起**（不再另发一张卡）。
+		// 展开态不记忆：任何一次刷新都回到收起 —— 表格是临时查阅用的，
+		// 用户要的是随时能回到干净的状态卡。
+		if (value.op === "models.toggle") {
 			if (typeof value.conversationKey !== "string") return undefined;
-			const data = await convManager?.modelsTableDataByKey(value.conversationKey);
+			const expanded = value.expanded === true;
+			const data = await convManager?.modelStatusCardDataByKey(value.conversationKey);
 			if (!data) {
-				log.warn("feishu.card.models_open_failed", { conversationKey: value.conversationKey });
-				return { toast: { type: "warning", content: "会话已失效，请重新发送 /models" } };
+				log.warn("feishu.card.models_toggle_failed", { conversationKey: value.conversationKey });
+				return { toast: { type: "warning", content: "会话已失效，请重新发送 /model" } };
 			}
-			log.info("feishu.card.models_open", { conversationKey: value.conversationKey });
-			if (!action.chatId) return { toast: { type: "warning", content: "无法确定目标会话" } };
-			try {
-				await transport?.sendCard(action.chatId, buildModelsTable(data));
-				return { toast: { type: "success", content: "已发送模型列表" } };
-			} catch (error) {
-				return { toast: { type: "warning", content: `发送失败：${error instanceof Error ? error.message.slice(0, 60) : "未知错误"}` } };
-			}
+			log.info("feishu.card.models_toggle", { expanded, conversationKey: value.conversationKey });
+			return { card: { type: "raw", data: buildModelStatusCard({ ...data, expanded }) } };
 		}
 		// P2-01：澄清选择 —— 只恢复等待点，不写任何授权
 		if (value.op === "clarify") {

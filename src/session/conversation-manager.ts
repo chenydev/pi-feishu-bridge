@@ -1205,6 +1205,7 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		thinkingLevel?: string;
 		availableLevels: string[];
 		conversationKey: string;
+		models: Array<{ id: string; provider?: string }>;
 	} | null> {
 		const key = buildConversationKey(msg, this.deps.config);
 		const session = this.getOrCreateSession(msg, key);
@@ -1219,9 +1220,10 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		}
 
 		let currentLabel = agent.modelId;
+		let models: Array<{ id: string; provider?: string }> = [];
 		try {
-			const all = (await agent.listModels?.()) ?? [];
-			const matches = all.filter((entry) => entry.id === agent.modelId);
+			models = (await agent.listModels?.()) ?? [];
+			const matches = models.filter((entry) => entry.id === agent.modelId);
 			const only = matches.length === 1 ? matches[0] : undefined;
 			if (only?.provider) currentLabel = `${only.provider}/${only.id}`;
 		} catch {
@@ -1235,6 +1237,8 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 			...(thinkingLevel ? { thinkingLevel } : {}),
 			availableLevels,
 			conversationKey: key,
+			// 展开表格时直接用这份清单，不必为同一件事再 listModels 一次
+			models,
 		};
 	}
 
@@ -1244,15 +1248,17 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		thinkingLevel?: string;
 		availableLevels: string[];
 		conversationKey: string;
+		models: Array<{ id: string; provider?: string }>;
 	} | null> {
 		const session = this.sessions.get(conversationKey);
 		if (!session?.agent) return null;
 		const agent = session.agent;
 
 		let currentLabel = agent.modelId;
+		let models: Array<{ id: string; provider?: string }> = [];
 		try {
-			const all = (await agent.listModels?.()) ?? [];
-			const matches = all.filter((entry) => entry.id === agent.modelId);
+			models = (await agent.listModels?.()) ?? [];
+			const matches = models.filter((entry) => entry.id === agent.modelId);
 			const only = matches.length === 1 ? matches[0] : undefined;
 			if (only?.provider) currentLabel = `${only.provider}/${only.id}`;
 		} catch {
@@ -1264,23 +1270,10 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 			...(thinkingLevel ? { thinkingLevel } : {}),
 			availableLevels: agent.availableThinkingLevels?.() ?? [],
 			conversationKey,
+			models,
 		};
 	}
 
-	/** 按钮回调用：按 key 取模型表格数据（「查看全部模型」按钮）。 */
-	async modelsTableDataByKey(conversationKey: string): Promise<{
-		models: Array<{ id: string; provider?: string }>; currentId: string;
-	} | null> {
-		const session = this.sessions.get(conversationKey);
-		if (!session?.agent?.listModels) return null;
-		try {
-			const models = await session.agent.listModels();
-			if (models.length === 0) return null;
-			return { models, currentId: session.agent.modelId };
-		} catch {
-			return null;
-		}
-	}
 
 	/** 按钮回调：按会话 key 切换思考等级（等价于 /thinking <level>）。 */
 	async setThinkingByKey(conversationKey: string, level: string): Promise<{ ok: boolean; reason?: string }> {

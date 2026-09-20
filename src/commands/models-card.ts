@@ -56,11 +56,9 @@ function executedBlock(command?: string): unknown[] {
 	];
 }
 
-export function buildModelsTable(input: ModelsTableInput): unknown {
-	const pageSize = input.pageSize ?? MODELS_TABLE_PAGE_SIZE;
-	const current = input.models.find((m) => m.id === input.currentId);
-
-	const rows = input.models.map((entry) => ({
+/** 表格元素（供独立表格卡片与状态卡的展开态共用）。 */
+function tableElements(models: ModelEntry[], currentId: string, pageSize = MODELS_TABLE_PAGE_SIZE): unknown[] {
+	const rows = models.map((entry) => ({
 		model: modelLabel(entry),
 		...(entry.name ? { name: entry.name } : {}),
 	}));
@@ -71,6 +69,26 @@ export function buildModelsTable(input: ModelsTableInput): unknown {
 		{ name: "model", display_name: "模型（provider/model）", data_type: "text", width: "auto" },
 		...(hasName ? [{ name: "name", display_name: "名称", data_type: "text", width: "auto" }] : []),
 	];
+
+	return [{
+		tag: "table",
+		page_size: pageSize,
+		row_height: "low",
+		header_style: {
+			text_align: "left",
+			text_size: "normal",
+			background_style: "grey",
+			text_color: "default",
+			bold: true,
+		},
+		columns,
+		rows,
+	}];
+}
+
+export function buildModelsTable(input: ModelsTableInput): unknown {
+	const pageSize = input.pageSize ?? MODELS_TABLE_PAGE_SIZE;
+	const current = input.models.find((m) => m.id === input.currentId);
 
 	return {
 		schema: "2.0",
@@ -86,20 +104,7 @@ export function buildModelsTable(input: ModelsTableInput): unknown {
 					content: `当前：**${current ? modelLabel(current) : input.currentId}**\n`
 						+ "切换用 `/model <provider>/<模型>`。表格可翻页，单元格可直接选中复制。",
 				},
-				{
-					tag: "table",
-					page_size: pageSize,
-					row_height: "low",
-					header_style: {
-						text_align: "left",
-						text_size: "normal",
-						background_style: "grey",
-						text_color: "default",
-						bold: true,
-					},
-					columns,
-					rows,
-				},
+				...tableElements(input.models, input.currentId, pageSize),
 			],
 		},
 	};
@@ -122,6 +127,15 @@ export interface ModelStatusInput {
 	 * 用户才能复制它去加 `-g`、转发给别人、或记进笔记。只有回调触发的重渲染才带它。
 	 */
 	lastExecuted?: string;
+	/**
+	 * 是否已展开模型表格（点 `/models` 展开；**任何刷新都回到收起**）。
+	 *
+	 * 展开只是"这一次渲染"的形态，不记忆：点档位刷新后表格自动收起 —— 用户要的是
+	 * 干净的状态卡，表格是临时查阅用的。因此桥侧**不需要**为每个会话存展开状态。
+	 */
+	expanded?: boolean;
+	/** 展开时并入的模型清单（收起时不传，省一次 listModels）。 */
+	models?: ModelEntry[];
 }
 
 /** 两列 key-value（column_set）：标签与值严格左对齐，比全角空格排版可靠。 */
@@ -237,8 +251,15 @@ export function buildModelStatusCard(input: ModelStatusInput): unknown {
 				tag: "column", width: "weighted", weight: 3,
 				elements: [{
 					tag: "button", size: "small", type: "primary",
-					text: { tag: "plain_text", content: "/models" },
-					value: { op: "models.open", conversationKey: input.conversationKey },
+					text: {
+						tag: "plain_text",
+						content: input.expanded ? "收起模型列表" : "/models",
+					},
+					value: {
+						op: "models.toggle",
+						expanded: !input.expanded,
+						conversationKey: input.conversationKey,
+					},
 				}],
 			},
 		],
@@ -254,6 +275,17 @@ export function buildModelStatusCard(input: ModelStatusInput): unknown {
 		content: "以上操作都等价于对应的斜杠命令。**加 `-g`（或 `--global`）可设为全局默认**，"
 			+ "对**之后新建的**会话生效（当前会话不受影响）。",
 	});
+
+	// 展开：把模型表格并进同一张卡（用户要的就是「一张卡、表格在下面」）。
+	// 复用 buildModelsTable 的表格元素，避免两处各写一份、改一处漏一处。
+	if (input.expanded) {
+		elements.push({ tag: "hr" });
+		elements.push({
+			tag: "markdown",
+			content: `**可用模型（${(input.models ?? []).length}）**　` + "切换用 `/model <provider>/<模型>`",
+		});
+		elements.push(...tableElements(input.models ?? [], input.currentLabel));
+	}
 
 	return {
 		schema: "2.0",

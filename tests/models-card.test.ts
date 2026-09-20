@@ -145,11 +145,13 @@ test("状态卡：「查看全部模型」按钮触发 models.open，并带 conv
 	const card = buildModelStatusCard({
 		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high"], conversationKey: "k",
 	}) as StatusCard;
-	const open = buttonsOf(card).find((b) => (b.value as { op: string }).op === "models.open");
-	assert.ok(open, "必须有查看全部模型的按钮");
+	const open = buttonsOf(card).find((b) => (b.value as { op: string }).op === "models.toggle");
+	assert.ok(open, "必须有模型列表按钮");
 	assert.equal((open.value as { conversationKey: string }).conversationKey, "k");
-	assert.equal((open.text as { content: string }).content, "/models", "按钮文字直接用命令名，看到的即是要打的");
+	assert.equal((open.text as { content: string }).content, "/models", "未展开时按钮文字直接用命令名");
 	assert.equal(open.type, "primary", "按钮要有颜色，看着才是能点的");
+	// 展开态文案反转 + 目标态取反（同一个按钮做展开/收起）
+	assert.equal((open.value as { expanded: boolean }).expanded, true, "未展开时点它应请求展开");
 });
 
 test("状态卡：没有可用档位时不出现空按钮组", () => {
@@ -157,7 +159,7 @@ test("状态卡：没有可用档位时不出现空按钮组", () => {
 		currentLabel: "m", thinkingLevel: "off", availableLevels: [], conversationKey: "k",
 	}) as StatusCard;
 	assert.equal(buttonsOf(card).filter((b) => (b.value as { op: string }).op === "thinking.set").length, 0);
-	assert.ok(buttonsOf(card).some((b) => (b.value as { op: string }).op === "models.open"), "「查看全部模型」仍在");
+	assert.ok(buttonsOf(card).some((b) => (b.value as { op: string }).op === "models.toggle"), "模型列表按钮仍在");
 });
 
 test("状态卡：完全没有思考等级时也不出档位区块", () => {
@@ -312,4 +314,31 @@ test("表格卡片：不出现已执行块（回执只属于会发生变化的�
 test("表格卡片：没有已执行时不出现该块（首屏干净）", () => {
 	const card = buildModelsTable({ models: [{ id: "a", provider: "p" }], currentId: "a" });
 	assert.doesNotMatch(JSON.stringify(card), /已执行/);
+});
+
+
+// ── 表格并入状态卡（不再另发一张卡）──────────────────────────────────
+
+test("状态卡：展开时把表格并进同一张卡，按钮变「收起模型列表」", () => {
+	const models = [{ id: "a", provider: "p" }, { id: "b", provider: "p" }];
+	const card = buildModelStatusCard({
+		currentLabel: "p/a", thinkingLevel: "high", availableLevels: ["high"],
+		conversationKey: "k", expanded: true, models,
+	}) as StatusCard;
+
+	const table = card.body.elements.find((e) => e.tag === "table");
+	assert.ok(table, "展开后同一张卡里应有表格");
+	assert.equal((table.rows as unknown[]).length, 2);
+	assert.equal(table.page_size, MODELS_TABLE_PAGE_SIZE, "客户端分页设置要保留");
+
+	const toggle = buttonsOf(card).find((b) => (b.value as { op: string }).op === "models.toggle");
+	assert.equal((toggle?.text as { content: string }).content, "收起模型列表");
+	assert.equal((toggle?.value as { expanded: boolean }).expanded, false, "展开态下点它应请求收起");
+});
+
+test("状态卡：收起态不含表格（省一次 listModels，卡片也不该无端变长）", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high"], conversationKey: "k",
+	}) as StatusCard;
+	assert.equal(card.body.elements.find((e) => e.tag === "table"), undefined);
 });
