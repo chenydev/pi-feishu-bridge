@@ -407,14 +407,16 @@ test("会话隔离：群内按用户隔离 + 话题内共享（hermes 模型）"
 	assert.equal(sessionFiles[2], sessionFiles[3] ?? sessionFiles[2]);
 });
 
-test("进度消息：发送→工具事件更新→完成撤回（方案 A）", async () => {
+test("进度消息：发送→工具事件更新→完成后按 keepOnFinish=false 撤回", async () => {
 	const { ConversationManager } = await import("../src/session/conversation-manager.js");
+	const { DEFAULT_CONFIG } = await import("../src/types.js");
 	const sent: string[] = [];
 	const edited: string[] = [];
 	const recalled: string[] = [];
 	const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 	const mgr = new ConversationManager({
-		config: cfg({ groupPolicy: "open" }),
+		// L3 默认保留进度；要测「撤回」这条路径就得显式关掉保留
+		config: cfg({ groupPolicy: "open", progress: { ...DEFAULT_CONFIG.progress, keepOnFinish: false } }),
 		sessionDir: "/tmp/feishu-test-progress",
 		sessionBackend: {
 			async createSession(opts: { sessionFile?: string }) {
@@ -439,7 +441,9 @@ test("进度消息：发送→工具事件更新→完成撤回（方案 A）", 
 	await sleep(1700); // 节流 1.5s
 	mgr.onToolEvent("sid1", "bash", "end");
 	assert.ok(edited.length >= 1, "工具事件应触发进度消息编辑");
-	assert.match(edited[0], /🔧/);
+	// 追加式日志 + 动词短语（bash 无参数时只有 emoji + 动词，没有孤零零的冒号）
+	assert.match(edited[0], /💻 运行/);
+	assert.match(edited[0], /🤖 执行过程/);
 	await sleep(1800); // prompt resolve → sendReply → 撤回进度消息
 	assert.equal(sent[0], "🤖 正在处理…");
 	assert.ok(recalled.length >= 1, "完成后应撤回进度消息");

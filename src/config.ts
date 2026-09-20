@@ -5,7 +5,7 @@
 import { chmodSync, existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
-import type { BridgeConfig, GroupPolicy } from "./types.js";
+import type { BridgeConfig, GroupPolicy, ProgressMode } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
 
 export interface ConfigPaths {
@@ -65,6 +65,21 @@ function requireGroupPolicy(value: unknown, source: string): GroupPolicy {
 	const policy = parseGroupPolicy(value);
 	if (!policy) throw new Error(`invalid group policy at ${source}: ${String(value)}`);
 	return policy;
+}
+
+const PROGRESS_MODES: readonly ProgressMode[] = ["off", "new", "all", "verbose"];
+
+/** 进度档位：写错就报错，不静默当默认值（否则「我明明配了 off 却还在发」很难查）。 */
+function requireProgressMode(value: unknown, source: string): ProgressMode {
+	if (typeof value === "string" && (PROGRESS_MODES as readonly string[]).includes(value)) return value as ProgressMode;
+	throw new Error(`invalid progress mode at ${source}: ${String(value)}（可选 ${PROGRESS_MODES.join("/")}）`);
+}
+
+/** 非负整数收敛；非法（NaN/负数/非数字）时回退默认，避免把消息行数算成 0 行。 */
+function clampCount(value: unknown, fallback: number, minimum: number, source: string): number {
+	if (value === undefined) return fallback;
+	if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`invalid number at ${source}: ${String(value)}`);
+	return Math.max(minimum, Math.floor(value));
 }
 
 function requireStringArray(value: unknown, source: string): string[] | undefined {
@@ -212,6 +227,14 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 		},
 	};
 	merged.groupPolicy = requireGroupPolicy((fileCfg as Record<string, unknown>).groupPolicy ?? merged.groupPolicy, "config.groupPolicy");
+	// 进度档位与数值：非法值直接报错（静默回默认会让「配了 off 却还在发」变成一道谜题）
+	merged.progress = {
+		mode: requireProgressMode(merged.progress.mode, "config.progress.mode"),
+		showThinking: Boolean(merged.progress.showThinking),
+		maxLines: clampCount(merged.progress.maxLines, DEFAULT_CONFIG.progress.maxLines, 1, "config.progress.maxLines"),
+		previewChars: clampCount(merged.progress.previewChars, DEFAULT_CONFIG.progress.previewChars, 4, "config.progress.previewChars"),
+		keepOnFinish: merged.progress.keepOnFinish !== false,
+	};
 	if (merged.defaultGroupPolicy !== undefined) merged.defaultGroupPolicy = requireGroupPolicy(merged.defaultGroupPolicy, "config.defaultGroupPolicy");
 	for (const [chatId, policy] of Object.entries(merged.groupPolicyByChat)) {
 		merged.groupPolicyByChat[chatId] = requireGroupPolicy(policy, `config.groupPolicyByChat.${chatId}`);
@@ -261,6 +284,11 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 	if (env.FEISHU_GROUP_ALSO_ON_REPLY) merged.groupAlsoOnReply = toBool(env.FEISHU_GROUP_ALSO_ON_REPLY, merged.groupAlsoOnReply);
 	if (env.FEISHU_REQUIRE_MENTION) merged.requireMention = toBool(env.FEISHU_REQUIRE_MENTION, merged.requireMention);
 	if (env.FEISHU_DEBUG) merged.debug = toBool(env.FEISHU_DEBUG, merged.debug);
+	// 进度档位环境变量开关（对齐 streamingCard 的 FEISHU_STREAMING_CARD 风格）：
+	// 排查“群里太吵/看不到执行过程”时不必改配置文件重挂载。
+	if (env.FEISHU_PROGRESS_MODE) {
+		merged.progress = { ...merged.progress, mode: requireProgressMode(env.FEISHU_PROGRESS_MODE, "FEISHU_PROGRESS_MODE") };
+	}
 	if (env.FEISHU_HOME_DIR) {
 		// 允许测试注入 home
 		const alt = resolvePaths(env.FEISHU_HOME_DIR);

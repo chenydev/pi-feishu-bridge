@@ -7,6 +7,9 @@
 
 export type GroupPolicy = "open" | "mention" | "disabled" | "allowlist" | "blacklist" | "admin_only";
 
+/** 进度展示档位（L3，对齐 hermes `display.tool_progress`）。 */
+export type ProgressMode = "off" | "new" | "all" | "verbose";
+
 /** 每群规则（hermes FeishuGroupRule 对齐）：未配置字段继承全局。 */
 export interface GroupRule {
 	policy?: GroupPolicy;
@@ -186,8 +189,26 @@ export interface BridgeConfig {
 	usage?: { balanceTtlMs?: number; snapshots?: boolean };
 	/** P1-08：空闲会话回收（与 maxActiveSessions 的“并发上限”语义不同）。 */
 	sessionLifecycle: { idleTtlMs: number; maxResidentSessions: number; sweepIntervalMs: number };
-	/** P1-02：处理中进度展示（工具名/耗时/脱敏摘要；思考摘要默认关闭）。 */
-	progress: { showThinking: boolean };
+	/**
+	 * P1-02/L1–L3：处理中进度展示。
+	 *
+	 * `mode` 对齐 hermes 的 `display.tool_progress`：`off` 完全不发进度消息；`new` 只在
+	 * **工具变化**时追加一行（hermes 给飞书的默认档，降噪）；`all` 每次工具调用都追加
+	 *（本桥默认 —— 用户诉求是「看到了执行了什么 bash 命令」，new 档会把连续同名工具折叠掉）；
+	 * `verbose` 同 `all` 但参数预览放宽到 180 字。
+	 *
+	 * `keepOnFinish` 默认 true（对齐 hermes `cleanup_progress: false`）：完成后**保留**进度消息，
+	 * 让「这轮做了什么」可回看；设为 false 才在交付最终答案后撤回。
+	 */
+	progress: {
+		mode: ProgressMode;
+		showThinking: boolean;
+		/** 进度消息最多保留多少行工具日志（超出则只显示最后 N 行 + 「共 N 步」）。 */
+		maxLines: number;
+		/** 单行参数预览截断长度（hermes 飞书档位 40）。 */
+		previewChars: number;
+		keepOnFinish: boolean;
+	};
 	/**
 	 * P2-02：受控工作区别名 —— 只允许别名映射到 realpath 白名单目录。
 	 * 空对象 = 功能关闭（默认）；绝对路径/`..`/白名单外的值一律拒绝。
@@ -247,7 +268,7 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 	footerByChat: {},
 	usage: { balanceTtlMs: 5 * 60_000, snapshots: true },
 	sessionLifecycle: { idleTtlMs: 30 * 60_000, maxResidentSessions: 32, sweepIntervalMs: 60_000 },
-	progress: { showThinking: false },
+	progress: { mode: "all", showThinking: false, maxLines: 6, previewChars: 40, keepOnFinish: true },
 	// P2-02：默认关闭 —— 未确定授权范围前不允许切换工作区
 	workspaces: { aliases: {} },
 	sessionDir: "sessions/feishu",

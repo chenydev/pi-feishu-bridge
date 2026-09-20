@@ -203,7 +203,9 @@ test("P1-01：卡片承载 final 后必须 ack 接管账本（否则重启会重
 		});
 		await waitUntil(() => calls.some((call) => call.includes("/elements/stream/content")));
 		await waitUntil(() => new PendingStore(pendingFile).depth() === 0);
-		assert.equal(sentTexts.length, 0, "卡片交付成功后不应再发重复文本");
+		// L1 起卡片模式下也会发一条**进度消息**（否则完全没有执行进度），但答案本身不得再发文本
+		const bodyTexts = sentTexts.filter((text) => !text.includes("正在处理") && !text.includes("执行过程"));
+		assert.equal(bodyTexts.length, 0, `卡片交付成功后不应再发重复文本：${JSON.stringify(sentTexts)}`);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

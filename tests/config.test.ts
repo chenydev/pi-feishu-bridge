@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadConfig, resolvePaths, resolveTimezone, formatTimeInZone } from "../src/config.js";
+import { DEFAULT_CONFIG } from "../src/types.js";
 
 function withConfigFile(value: unknown, run: (home: string) => void): void {
 	const home = mkdtempSync(join(tmpdir(), "pi-feishu-bridge-config-"));
@@ -141,4 +142,47 @@ test("页脚群级开关：群级优先于全局，缺省跟随全局，非法�
 		writeFileSync(join(dir, "feishu-bridge", "config.json"), JSON.stringify({ ...base, footerByChat: { oc_a: "yes" } }));
 		assert.throws(() => loadConfig(dir, {}), /footerByChat\.oc_a 必须是 true\/false/);
 	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("进度档位：默认 all，env 可覆盖，非法值报错而不是静默回默认", () => {
+	assert.deepEqual(loadConfig("/not-used", {}).progress, DEFAULT_CONFIG.progress, "缺省沿用默认（all + 保留）");
+
+	for (const mode of ["off", "new", "all", "verbose"]) {
+		assert.equal(loadConfig("/not-used", { FEISHU_PROGRESS_MODE: mode }).progress.mode, mode);
+	}
+	// 写错了要让启动失败，否则「我明明配了 off 却还在发」无从排查
+	assert.throws(() => loadConfig("/not-used", { FEISHU_PROGRESS_MODE: "quiet" }), /invalid progress mode/);
+});
+
+test("进度档位：文件里非法 mode / 数值 fail-fast，keepOnFinish 只认 false", () => {
+	withConfigFile({ progress: { mode: "off", maxLines: 2, previewChars: 12, keepOnFinish: false } }, (home) => {
+		const cfg = loadConfig(home, {});
+		assert.equal(cfg.progress.mode, "off");
+		assert.equal(cfg.progress.maxLines, 2);
+		assert.equal(cfg.progress.previewChars, 12);
+		assert.equal(cfg.progress.keepOnFinish, false);
+	});
+
+	withConfigFile({ progress: { mode: "quiet" } }, (home) => {
+		assert.throws(() => loadConfig(home, {}), /invalid progress mode/);
+	});
+	withConfigFile({ progress: { maxLines: "很多" } }, (home) => {
+		assert.throws(() => loadConfig(home, {}), /invalid number at config\.progress\.maxLines/);
+	});
+	withConfigFile({ progress: { maxLines: 0 } }, (home) => {
+		assert.equal(loadConfig(home, {}).progress.maxLines, 1, "行数下限收敛到 1，不能配成 0 行");
+	});
+	withConfigFile({ progress: { previewChars: 0 } }, (home) => {
+		assert.equal(loadConfig(home, {}).progress.previewChars, 4, "预览下限收敛到 4");
+	});
+	withConfigFile({ progress: { keepOnFinish: "yes" } }, (home) => {
+		assert.equal(loadConfig(home, {}).progress.keepOnFinish, true, "只显式 false 才关掉保留");
+	});
+});
+
+test("进度档位：env 覆盖优先于文件", () => {
+	withConfigFile({ progress: { mode: "off" } }, (home) => {
+		assert.equal(loadConfig(home, { FEISHU_PROGRESS_MODE: "all" }).progress.mode, "all");
+		assert.equal(loadConfig(home, {}).progress.mode, "off");
+	});
 });
