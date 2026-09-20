@@ -2,6 +2,7 @@
   "appId": "cli_xxxxxxxxxxxxxxxx",
   "appSecret": "replace-me",
   "domain": "feishu",
+  "timezone": "Asia/Shanghai",
   "groupPolicy": "mention",
   "allowChats": [
     "oc_test_chat_id"
@@ -30,7 +31,10 @@
   },
   "approval": {
     "autoApprove": [],
-    "timeoutMs": 300000
+    "timeoutMs": 300000,
+    "forwarding": {
+      "enabled": false
+    }
   },
   "reaction": {
     "processingEmoji": "Typing",

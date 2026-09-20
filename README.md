@@ -21,6 +21,7 @@
 ### 交互
 
 - **工具审批卡**：工具调用前弹卡片（一次性 / 本会话 / 始终 / 拒绝），超时自动失效，防重放；管理员可配置免审批
+- **「始终批准」跨进程可用**：`pi-permission-system` 转来的 ask 同样支持「始终批准」—— 语义对齐 PS 原生对话框（记在**父会话**而非子会话，撤销后立即恢复询问），入口是 `/feishu always`
 - **澄清选择卡**：Agent 可就地提问并给出选项，超时或越权自动回退为文本
 - **流式输出**：内置文本流式（默认）；可选 CardKit 流式卡片（需应用权限，见下）
 - **进度与思考**：工具名 + 耗时 + 脱敏命令摘要，工具风暴自动折叠
@@ -37,6 +38,7 @@
 | `/model` `/models` `/thinking` | 切换模型与思考强度 |
 | `/workspace` | 切换工作区（白名单别名） |
 | `/feishu status` `/feishu policy` `/feishu export` | 状态、群策略、脱敏诊断包导出 |
+| `/feishu always [revoke <规则名>]` | 管理员查看/撤销「始终批准」规则（转发路径的持久放行） |
 
 ### 触发与准入
 
@@ -94,6 +96,10 @@ env 优先，`config.json` 持久化（路径 `$FEISHU_BRIDGE_HOME/feishu-bridge
 | `FEISHU_GROUP_POLICY` | `groupPolicy` | 群策略默认值 |
 | `FEISHU_ALLOW_CHATS` / `FEISHU_ALLOW_USERS` / `FEISHU_ADMINS` | 同名字段 | csv |
 | `FEISHU_STREAMING_CARD` | `streamingCard.enabled` | `1` 打开流式卡片（默认关） |
+| `FEISHU_PS_FORWARDING` | `approval.forwarding.enabled` | `1` 打开「pi-permission-system 父会话转发」（默认关，见下） |
+| `FEISHU_TIMEZONE` | `timezone` | 展示用时区（IANA 名，默认 `Asia/Shanghai`）。判定顺序：`FEISHU_TIMEZONE` > 配置文件 > 容器 `TZ` > 默认。无效值自动跳过，不会导致启动失败 |
+| — | `approval.forwarding.parentSessionId` | 桥侧父会话 id（默认 `feishu-bridge-parent`） |
+| `FEISHU_PS_ALWAYS` | `approval.forwarding.alwaysApprove` | 转发路径的「始终批准」（默认 **开**）：命中已记规则的 ask 直接放行、不再弹卡。`0` 关闭（关掉后卡片只剩三档） |
 | — | `streamingCard.printFrequencyMs` / `printStep` | 打字机节奏：每 N 毫秒上屏 M 字。**平台默认 1字/70ms（500 字要播 35 秒）**，推荐 3字/20ms（150 字/秒） |
 | — | `approval.adminSkipApproval` | 管理员/归属人免审批（默认 `false`） |
 | — | `adminBypassMention` | 管理员是否豁免 @（默认 `false`） |
@@ -101,6 +107,27 @@ env 优先，`config.json` 持久化（路径 `$FEISHU_BRIDGE_HOME/feishu-bridge
 | — | `workspaces.aliases` | 工作区别名白名单（默认空 = 功能关闭） |
 
 环境变量优先级**高于** `config.json` —— 注意 shell 里残留的同名变量会静默覆盖配置文件。
+
+**时区**：容器基础镜像是 UTC，compose 里用 `TZ=${DMA_TZ:-Asia/Shanghai}` 设成上海（改这个需要 `docker compose up -d` 重建，`restart` 不生效）。
+⚠️ **`docker logs --timestamps` 的时间戳永远是 UTC** —— 那是 Docker 守护进程加的，容器 `TZ` 影响不了它；容器内的 `date` 和应用内的时间显示才跟随 `TZ`。排障时对齐时间记得差 8 小时。
+
+### 让 pi-permission-system 的 `ask` 走飞书审批卡（实验性，默认关）
+
+`approval.policyEngine = "pi-permission-system"` 时策略归该扩展，但它的 `ask` 需要一个**父会话**来应答：
+子会话把请求写进文件信箱，父会话写回响应。桥可以扮演这个父会话（而且不要求是 pi 进程）：
+
+```jsonc
+// config.json
+"approval": { "forwarding": { "enabled": true } }   // 或 FEISHU_PS_FORWARDING=1
+```
+
+- 桥向进程环境声明父子关系：`PI_SUBAGENT_PARENT_SESSION`（PS 文档的 subagent adapter convention，主变量）
+  与 `PI_AGENT_ROUTER_PARENT_SESSION_ID`（历史兼容名，同值）—— 两者都指向桥侧父会话 id，
+  因此进程内所有会话的 ask 都会转发给桥；然后在 `$PI_CODING_AGENT_DIR/sessions/permission-forwarding/`
+  下发布心跳、轮询子会话的请求文件，把每个 `ask` 变成飞书审批卡；用户点完写回响应。
+- 卡片只提供**「仅本次 / 本会话 / 拒绝」** —— 转发路径写不进对方策略引擎的配置，所以不给「始终批准」这种做不到的按钮。
+- 打不开时的降级行为：扩展缺席则不声明父子关系（回落到现状）；关掉开关会撤掉自己的声明。
+- 轮询/心跳参数（`PS_FORWARDING_POLL_INTERVAL_MS` 等）对齐 33.0.3 的实现，见 `src/approval/ps-forwarding.ts`。
 
 ---
 

@@ -22,6 +22,7 @@ export const FEISHU_SLASH_COMMANDS: ReadonlyArray<SlashCommandHelp> = [
 	{ usage: "/feishu doctor", description: "运行飞书桥可解释诊断（积压/错误类别/限流/待审批）" },
 	{ usage: "/feishu export", description: "管理员导出脱敏诊断包（0600，仅计数与枚举）" },
 	{ usage: "/feishu policy <策略>", description: "管理员设置当前群策略" },
+	{ usage: "/feishu always [revoke <规则名>]", description: "管理员查看/撤销「始终批准」规则" },
 ];
 
 export function formatSlashCommandHelp(): string {
