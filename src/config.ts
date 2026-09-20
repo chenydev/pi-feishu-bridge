@@ -15,6 +15,8 @@ export interface ConfigPaths {
 	outboxFile: string;
 	dedupeFile: string;
 	knownChatsFile: string;
+	/** 「始终批准」规则表（转发路径）。 */
+	alwaysApprovedFile: string;
 }
 
 export function resolvePaths(homeDir: string): ConfigPaths {
@@ -25,6 +27,7 @@ export function resolvePaths(homeDir: string): ConfigPaths {
 		outboxFile: join(homeDir, "feishu-bridge", "outbox.jsonl"),
 		dedupeFile: join(homeDir, "feishu-bridge", "dedupe.jsonl"),
 		knownChatsFile: join(homeDir, "feishu-bridge", "known-chats.json"),
+		alwaysApprovedFile: join(homeDir, "feishu-bridge", "ps-always-approved.json"),
 	};
 }
 
@@ -80,6 +83,53 @@ function validateGroupRule(value: unknown, source: string): import("./types.js")
 }
 
 /**
+ * 判断 IANA 时区名是否可用。
+ *
+ * `Intl.DateTimeFormat` 遇到未知时区会抛 `RangeError` —— 配置里一个拼错的时区名
+ * 不该把整个桥弄挂，所以这里先探测再用。
+ */
+function isValidTimezone(value: string): boolean {
+	try {
+		new Intl.DateTimeFormat("en-US", { timeZone: value });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * 解析展示用时区：FEISHU_TIMEZONE > config.json > 容器 TZ > 默认。
+ *
+ * 三层是有意的：容器 TZ 决定系统级时间（日志、date），config/环境变量让桥的
+ * 展示可以被单独覆盖（比如容器是 UTC 但想让用户看到北京时间）。
+ * 任何一层给了无效值都跳过，最终兜底到默认值 —— 绝不因为时区配置写错而启动失败。
+ */
+export function resolveTimezone(
+	fileCfg: Pick<Partial<BridgeConfig>, "timezone">,
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	const candidates = [env.FEISHU_TIMEZONE, fileCfg.timezone, env.TZ, DEFAULT_CONFIG.timezone];
+	for (const candidate of candidates) {
+		if (typeof candidate !== "string") continue;
+		const value = candidate.trim();
+		if (value && isValidTimezone(value)) return value;
+	}
+	return DEFAULT_CONFIG.timezone;
+}
+
+/** 按配置时区格式化时间（面向用户的展示用）。时区无效时退回系统默认，绝不抛。 */
+export function formatTimeInZone(timestamp: number, timeZone?: string): string {
+	try {
+		return new Date(timestamp).toLocaleTimeString("zh-CN", {
+			timeZone: timeZone ?? DEFAULT_CONFIG.timezone,
+			hour12: false,
+		});
+	} catch {
+		return new Date(timestamp).toLocaleTimeString("zh-CN", { hour12: false });
+	}
+}
+
+/**
  * 合并顺序：默认值 < config.json < env。
  * env 键：FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_DOMAIN / FEISHU_GROUP_POLICY /
  * FEISHU_GROUP_POLICY_BY_CHAT(JSON) / FEISHU_ALLOW_CHATS(csv) / FEISHU_ALLOW_USERS(csv) /
@@ -94,6 +144,8 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 	const merged: BridgeConfig = {
 		...DEFAULT_CONFIG,
 		...fileCfg,
+		// 时区要显式解析：env 的 FEISHU_TIMEZONE 优先于配置文件，跨层兜底到容器 TZ。
+		timezone: resolveTimezone(fileCfg, env),
 		// 旧版配置可能只保存 enabled/textWindowMs；逐字段合并以继承 V2 上限。
 		batch: { ...DEFAULT_CONFIG.batch, ...fileCfg.batch },
 		forwarding: { ...DEFAULT_CONFIG.forwarding, ...fileCfg.forwarding },
@@ -108,6 +160,21 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 				enabled: fileCfg.approval?.commandPolicy?.enabled ?? DEFAULT_CONFIG.approval.commandPolicy?.enabled ?? true,
 				extraReadOnly: fileCfg.approval?.commandPolicy?.extraReadOnly ?? DEFAULT_CONFIG.approval.commandPolicy?.extraReadOnly,
 				extraDangerous: fileCfg.approval?.commandPolicy?.extraDangerous ?? DEFAULT_CONFIG.approval.commandPolicy?.extraDangerous,
+			},
+			// 开关优先级：环境变量 FEISHU_PS_FORWARDING=1/0 > 配置文件 > 默认（关）。
+			// 与 streamingCard 同一约定：实验能力必须显式开启。
+			forwarding: {
+				enabled: envPsForwardingEnabled(env)
+					?? fileCfg.approval?.forwarding?.enabled
+					?? DEFAULT_CONFIG.approval.forwarding?.enabled
+					?? false,
+				parentSessionId: fileCfg.approval?.forwarding?.parentSessionId
+					?? DEFAULT_CONFIG.approval.forwarding?.parentSessionId,
+				// 「始终批准」：env FEISHU_PS_ALWAYS=0 可强制关闭（与其它实验能力同一约定）
+				alwaysApprove: envAlwaysApprove(env)
+					?? fileCfg.approval?.forwarding?.alwaysApprove
+					?? DEFAULT_CONFIG.approval.forwarding?.alwaysApprove
+					?? true,
 			},
 		},
 		// 开关优先级：环境变量 FEISHU_STREAMING_CARD=1/true 可强制打开（便于容器里临时实验），
@@ -212,6 +279,25 @@ export function saveConfig(homeDir: string, cfg: BridgeConfig): boolean {
 
 export function loadJsonFile<T>(file: string): T | undefined {
 	return loadJson<T>(file);
+}
+
+/** 环境变量开关：FEISHU_PS_FORWARDING=1|true|yes 打开父会话转发；0|false|no 强制关闭；未设置返回 undefined。 */
+/** `FEISHU_PS_ALWAYS`：`0`/`false` 关闭「始终批准」，`1`/`true` 打开；未设 = 交给配置文件。 */
+function envAlwaysApprove(env: NodeJS.ProcessEnv = process.env): boolean | undefined {
+	const raw = env.FEISHU_PS_ALWAYS;
+	if (raw === undefined || raw === "") return undefined;
+	if (raw === "0" || raw.toLowerCase() === "false") return false;
+	if (raw === "1" || raw.toLowerCase() === "true") return true;
+	return undefined;
+}
+
+function envPsForwardingEnabled(env: NodeJS.ProcessEnv = process.env): boolean | undefined {
+	const raw = env.FEISHU_PS_FORWARDING;
+	if (raw === undefined || raw === "") return undefined;
+	const normalized = raw.trim().toLowerCase();
+	if (["1", "true", "yes", "on"].includes(normalized)) return true;
+	if (["0", "false", "no", "off"].includes(normalized)) return false;
+	return undefined;
 }
 
 /** 环境变量开关：FEISHU_STREAMING_CARD=1|true|yes 打开流式卡片；0|false|no 强制关闭；未设置返回 undefined。 */
