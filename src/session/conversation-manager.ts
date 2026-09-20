@@ -16,6 +16,10 @@ import { adaptAgentEvent } from "../outbound/agent-event-adapter.js";
 import { StreamingCard } from "../outbound/streaming-card.js";
 import { LiveChannel, SerialWriter } from "../outbound/live-channel.js";
 import { createRunMetrics, elapsedMs as metricsElapsedMs, recordUsage, renderFooter } from "../outbound/run-metrics.js";
+import { resolveFooterEnabled } from "../config.js";
+import { cnyPerUsdForModel } from "../outbound/deepseek-usage.js";
+import { stripFooterFromQuote, stripMarkdown } from "../outbound/run-metrics.js";
+import type { RunUsage, SessionUsage, UsageSnapshot } from "../commands/usage-card.js";
 import { RateBudget } from "../runtime/rate-budget.js";
 import { randomUUID } from "node:crypto";
 import type { ResourceRef } from "../types.js";
@@ -29,6 +33,32 @@ function formatRelative(timestamp: number, now: number): string {
 	if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`;
 	if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时前`;
 	return `${Math.floor(delta / 86_400_000)} 天前`;
+}
+
+/**
+ * P1-03：把 SDK 会话统计收成报告用的形状。
+ *
+ * 两层容错：老 SDK 没这个方法、或取统计时抛错 —— 两者都只是"这段不显示"，
+ * 不能让页脚和 `/feishu usage` 整体挂掉。
+ */
+function sessionUsageStats(agent: AgentHandle | undefined): SessionUsage | undefined {
+	try {
+		const stats = agent?.getSessionStats?.();
+		if (!stats) return undefined;
+		const tokens = stats.tokens;
+		return {
+			...(tokens
+				? { tokens: { input: tokens.input, output: tokens.output, cacheRead: tokens.cacheRead, cacheWrite: tokens.cacheWrite } }
+				: {}),
+			...(typeof stats.cost === "number" ? { cost: stats.cost } : {}),
+			...(stats.contextUsage ? { contextUsage: stats.contextUsage } : {}),
+			...(typeof stats.userMessages === "number" ? { userMessages: stats.userMessages } : {}),
+			...(typeof stats.assistantMessages === "number" ? { assistantMessages: stats.assistantMessages } : {}),
+			...(typeof stats.toolCalls === "number" ? { toolCalls: stats.toolCalls } : {}),
+		};
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -138,6 +168,8 @@ interface BridgeSession {
 	runIdleTimer?: ReturnType<typeof setTimeout>;
 	/** 空闲超时时用来 reject run 的句柄（按会话，避免多会话并发互相覆盖）。 */
 	runIdleReject?: (error: Error) => void;
+	/** P1-03：最近一轮 run 的指标快照（`/feishu usage` 展示用）。 */
+	lastRun?: RunUsage;
 }
 
 interface QueuedMessage {	runId: string;
@@ -585,7 +617,11 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 			text += resources.promptSuffix;
 		}
 		if (item.replyToMessageId && item.replyToText) {
-			const quote = item.replyToText.slice(0, 500).replace(/@_user_\w+/g, "@").replace(/\n/g, " ");
+			// 先剔掉桥自己加的页脚块：那是给人看的元信息，不该每轮花 token 喂回模型。
+			// 先按注册表精确匹配我们发过的原文，再按行形态兜底（保证一定删干净）。
+			const strippedQuote = stripFooterFromQuote(item.replyToText, this.sentFooters);
+			// 整条都是页脚（引用了一条纯元信息消息）：注入占位提示，别塞空引用
+			const quote = (strippedQuote.trim() || "[无法获取被回复消息原文]").slice(0, 500).replace(/@_user_\w+/g, "@").replace(/\n/g, " ");
 		const replyingToSelf = Boolean(this.deps.lastSent?.has(item.replyToMessageId));
 			text = replyingToSelf
 				? `[你正在回复自己上一条消息，原文："${quote}"]\n\n${text}`
@@ -1019,17 +1055,70 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		});
 	}
 
-	/** P1-03：final 页脚（配置关闭时返回空串）。 */
-	private footerFor(metrics: ReturnType<typeof createRunMetrics>): string {
-		if (!this.deps.config.footer?.enabled) return "";
+	/**
+	 * P1-03：final 页脚（配置关闭时返回空串）。
+	 *
+	 * 上下文占用取自 SDK 会话统计（拿不到就不显示该段）：不能用 run 指标里的 token
+	 * 加总代替 —— 那个是「本轮花了多少」，上下文是「当前窗口占了多少」，压缩后两者
+	 * 会差一个数量级。
+	 */
+	private footerFor(metrics: ReturnType<typeof createRunMetrics>, sess: BridgeSession): string {
+		const footerCfg = this.deps.config.footer;
+		// 群级开关优先（管理员可用 /feishu footer off 当场关掉本群页脚）
+		if (!resolveFooterEnabled(this.deps.config, sess.chatId).enabled) return "";
 		try {
+			const stats = footerCfg.showSession === false ? undefined : sessionUsageStats(sess.agent);
 			return renderFooter(metrics, {
 				elapsedMs: metricsElapsedMs(metrics),
-				showCost: this.deps.config.footer?.showCost !== false,
+				// 模型优先用会话当下的（本轮没收到 usage 事件时 metrics.model 是空的）
+				model: metrics.model ?? sess.agent?.modelId,
+				showCost: footerCfg.showCost !== false,
+				showCny: footerCfg.showCny !== false,
+				cnyPerUsd: cnyPerUsdForModel(metrics.model ?? sess.agent?.modelId),
+				context: footerCfg.showContext === false ? undefined : stats?.contextUsage,
+				...(stats
+					? { session: { ...(stats.tokens ? { tokens: stats.tokens } : {}), ...(typeof stats.cost === "number" ? { cost: stats.cost } : {}) } }
+					: {}),
 			});
 		} catch {
 			return "";
 		}
+	}
+
+	/**
+	 * P1-03：`/feishu usage` 的数据源 —— 会话累计（SDK 统计）+ 本轮 run 指标。
+	 *
+	 * 不新建会话：没有会话就是没有用量，回 null 让命令层告诉用户去发条消息。
+	 */
+	usageSnapshot(msg: FeishuInboundMessage): UsageSnapshot | undefined {
+		const key = buildConversationKey(msg, this.deps.config);
+		const session = this.sessions.get(key);
+		if (!session) return undefined;
+		const stats = sessionUsageStats(session.agent);
+		const modelLabel = session.agent?.modelId;
+		return {
+			...(modelLabel ? { modelLabel } : {}),
+			...(stats ? { session: stats } : {}),
+			...(session.lastRun ? { run: session.lastRun } : {}),
+		};
+	}
+
+	/**
+	 * 最近发出的文本页脚原文（FIFO，上限 50 条）。
+	 *
+	 * 为什么记：引用回复时要把页脚从注入的引用块里去掉。单靠行形态判断是"超集"，
+	 * 有极小概率误删正文；先按注册表做整段后缀精确匹配，就能做到"确定删掉我们写进去的那段"。
+	 * 进程重启后为空 → 退化成行形态判断，仍然能删干净。
+	 */
+	private readonly sentFooters: string[] = [];
+
+	private rememberSentFooter(footer: string): void {
+		const text = footer.trim();
+		if (!text) return;
+		const existing = this.sentFooters.indexOf(text);
+		if (existing >= 0) this.sentFooters.splice(existing, 1);
+		this.sentFooters.push(text);
+		if (this.sentFooters.length > 50) this.sentFooters.shift();
 	}
 
 	private async trySteer(sess: BridgeSession, item: QueuedMessage): Promise<boolean> {
@@ -1616,7 +1705,7 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 					chatId: sess.chatId,
 					replyTo: item.messageId,
 					threadId: sess.threadId ?? item.threadId,
-				});
+				}, "正在处理…", { withMetrics: resolveFooterEnabled(this.deps.config, sess.chatId).enabled });
 				if (!started) streamCard = undefined;
 			}
 
@@ -1640,8 +1729,22 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 
 			// 最终发送：最后一轮 message_end 文本优先，其次流式累积/返回值
 			const rawText = lastEndText || streamedText.trim() || extractAssistantText(result);
-			const footer = this.footerFor(metrics);
-			const text = rawText && footer ? `${rawText}\n\n${footer}` : rawText;
+			const footer = this.footerFor(metrics, sess);
+			// 卡片模式：页脚走**独立元素**（分割线 + 小号淡色块），不拼进答案正文
+			const footerBlock = footer.replace(/^———\n/, "");
+			// P1-03：留一份本轮快照，`/feishu usage` 用（会话被回收后自然消失）
+			sess.lastRun = {
+				...(metrics.model ? { model: metrics.model } : {}),
+				tokens: { ...metrics.usage },
+				cost: metrics.cost,
+				hasCost: metrics.hasCost,
+				elapsedMs: metricsElapsedMs(metrics),
+			};
+			// 文本通道不解析 markdown、也没有分割线元素：同一份页脚落到纯文本前要先剥标记
+			// 与 `———` 标记（那是给卡片/引用剥离用的内部标记，不是给人看的字面内容）
+			const footerPlain = footer ? stripMarkdown(footer.replace(/^———\n/, "")) : "";
+			if (footerPlain) this.rememberSentFooter(footerPlain);
+			const text = rawText && footerPlain ? `${rawText}\n\n${footerPlain}` : rawText;
 			this.deps.log?.("info", "feishu.conv.stream_stats", logMeta({
 				chatId: sess.chatId,
 				deltaCount,
@@ -1655,8 +1758,9 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 			}));
 			let cardDelivered = false;
 			if (streamCard && text) {
-				// 卡片承载最终答案：成功则不再重复发文本（失败则落回下面的 durable 文本通道）
-				cardDelivered = await streamCard.finish(text);
+				// 卡片承载最终答案：成功则不再重复发文本（失败则落回下面的 durable 文本通道）。
+				// 正文与页脚分开传：页脚是元信息，写进独立元素（见 StreamingCard.finish）。
+				cardDelivered = await streamCard.finish(rawText || text, footerBlock ? { metrics: footerBlock } : undefined);
 				if (cardDelivered) {
 					// 卡内容已由飞书侧持久化，等价于「final 已交付」；
 					// 必须同时置 durableHandled，否则接管账本不会 ack，重启后会把同一条消息重放成重复任务。

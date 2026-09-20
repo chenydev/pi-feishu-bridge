@@ -42,7 +42,14 @@
   },
   "footer": {
     "enabled": true,
-    "showCost": true
+    "showCost": true,
+    "showCny": true,
+    "showContext": true,
+    "showSession": true
+  },
+  "usage": {
+    "balanceTtlMs": 300000,
+    "snapshots": true
   },
   "progress": {
     "showThinking": false
@@ -60,5 +67,6 @@
     "printFrequencyMs": 20,
     "printStep": 3,
     "_comment_typing": "打字机效果：每 printFrequencyMs 毫秒上屏 printStep 个字。平台默认 1字/70ms（500 字要播 35 秒）。实测 3字/20ms（150 字/秒）体感最佳。"
-  }
+  },
+  "footerByChat": {}
 }

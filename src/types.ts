@@ -164,8 +164,26 @@ export interface BridgeConfig {
 		/** 打字机参数：每次上屏字符数。平台默认 1（500 字要播 35 秒），实测 50 可显著加速。 */
 		printStep?: number;
 	};
-	/** P1-03：final 页脚（模型/耗时/token/费用估算）。 */
-	footer: { enabled: boolean; showCost: boolean };
+	/**
+	 * P1-03：final 页脚（模型/耗时/token/上下文/费用估算）。
+	 *
+	 * `showCny` / `showContext` 默认开；关掉后回到旧版页脚（只有 $ 与 token）。
+	 */
+	footer: { enabled: boolean; showCost: boolean; showCny?: boolean; showContext?: boolean; showSession?: boolean };
+	/**
+	 * 页脚**群级开关**（chat_id → 是否显示）。
+	 *
+	 * 为什么不只放全局：页脚对"看答案的人"是噪声，对"管钱的人"是信号 —— 群里谁来
+	 * 决定？让该群的管理员当场决定（`/feishu footer off`），而不是让所有人一起去改配置。
+	 * 缺省（该群没有条目）= 跟随 `footer.enabled`。
+	 */
+	footerByChat?: Record<string, boolean>;
+	/**
+	 * P1-03：用量报告（`/feishu usage`）的账户余额查询。
+	 *
+	 * 只在用户主动执行命令时才打外部接口，带 TTL 缓存（避免连续查询打爆）。
+	 */
+	usage?: { balanceTtlMs?: number; snapshots?: boolean };
 	/** P1-08：空闲会话回收（与 maxActiveSessions 的“并发上限”语义不同）。 */
 	sessionLifecycle: { idleTtlMs: number; maxResidentSessions: number; sweepIntervalMs: number };
 	/** P1-02：处理中进度展示（工具名/耗时/脱敏摘要；思考摘要默认关闭）。 */
@@ -225,7 +243,9 @@ export const DEFAULT_CONFIG: BridgeConfig = {
 		},
 	},
 	reaction: { processingEmoji: "Typing", enabled: true },
-	footer: { enabled: true, showCost: true },
+	footer: { enabled: true, showCost: true, showCny: true, showContext: true, showSession: true },
+	footerByChat: {},
+	usage: { balanceTtlMs: 5 * 60_000, snapshots: true },
 	sessionLifecycle: { idleTtlMs: 30 * 60_000, maxResidentSessions: 32, sweepIntervalMs: 60_000 },
 	progress: { showThinking: false },
 	// P2-02：默认关闭 —— 未确定授权范围前不允许切换工作区
@@ -355,7 +375,26 @@ export interface SessionBackend {
 			sessionName?(): string | undefined;
 			/** P1-04：重命名当前会话（写入 Pi transcript）。 */
 			setSessionName?(name: string): void;
+			/** P1-03：会话累计统计（token/费用/上下文占用）；老 SDK 可能没这个方法。 */
+			getSessionStats?(): PiSessionStats | undefined;
 		}>;
+}
+
+/**
+ * `AgentSession.getSessionStats()` 的最小子集（只声明桥用到的字段）。
+ *
+ * 不直接 import SDK 类型：桥对 pi 的依赖面一直保持在「官方导出 + 结构匹配」级别
+ * （见 DESIGN §7.2），SDK 加字段不会让桥编译不过。
+ */
+export interface PiSessionStats {
+	tokens?: { input: number; output: number; cacheRead: number; cacheWrite: number; total?: number };
+	/** 会话累计费用（USD，pi 口径；已含各消息的 peak/off-peak 计价）。 */
+	cost?: number;
+	/** 当前上下文窗口占用（压缩后 tokens/percent 可能为 null）。 */
+	contextUsage?: { tokens?: number | null; contextWindow?: number | null; percent?: number | null };
+	userMessages?: number;
+	assistantMessages?: number;
+	toolCalls?: number;
 }
 
 export interface BridgeSessionState {

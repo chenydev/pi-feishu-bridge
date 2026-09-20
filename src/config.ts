@@ -17,6 +17,8 @@ export interface ConfigPaths {
 	knownChatsFile: string;
 	/** 「始终批准」规则表（转发路径）。 */
 	alwaysApprovedFile: string;
+	/** P1-03：DeepSeek 余额快照（`/feishu usage` 的消耗速率依据）。 */
+	balanceSnapshotsFile: string;
 }
 
 export function resolvePaths(homeDir: string): ConfigPaths {
@@ -28,6 +30,7 @@ export function resolvePaths(homeDir: string): ConfigPaths {
 		dedupeFile: join(homeDir, "feishu-bridge", "dedupe.jsonl"),
 		knownChatsFile: join(homeDir, "feishu-bridge", "known-chats.json"),
 		alwaysApprovedFile: join(homeDir, "feishu-bridge", "ps-always-approved.json"),
+		balanceSnapshotsFile: join(homeDir, "feishu-bridge", "deepseek-balance-snapshots.jsonl"),
 	};
 }
 
@@ -199,6 +202,7 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 		allowBots: fileCfg.allowBots ?? DEFAULT_CONFIG.allowBots,
 		reaction: { ...DEFAULT_CONFIG.reaction, ...fileCfg.reaction },
 		footer: { ...DEFAULT_CONFIG.footer, ...fileCfg.footer },
+		usage: { ...DEFAULT_CONFIG.usage, ...fileCfg.usage },
 		sessionLifecycle: { ...DEFAULT_CONFIG.sessionLifecycle, ...fileCfg.sessionLifecycle },
 		progress: { ...DEFAULT_CONFIG.progress, ...fileCfg.progress },
 		workspaces: {
@@ -211,6 +215,11 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 	if (merged.defaultGroupPolicy !== undefined) merged.defaultGroupPolicy = requireGroupPolicy(merged.defaultGroupPolicy, "config.defaultGroupPolicy");
 	for (const [chatId, policy] of Object.entries(merged.groupPolicyByChat)) {
 		merged.groupPolicyByChat[chatId] = requireGroupPolicy(policy, `config.groupPolicyByChat.${chatId}`);
+	}
+	// 页脚群级开关：只接受布尔值（写坏了就是写坏了，不要静默当默认值）
+	merged.footerByChat = { ...(DEFAULT_CONFIG.footerByChat ?? {}), ...(merged.footerByChat ?? {}) };
+	for (const [chatId, enabled] of Object.entries(merged.footerByChat)) {
+		if (typeof enabled !== "boolean") throw new Error(`config.footerByChat.${chatId} 必须是 true/false`);
 	}
 	for (const [chatId, rule] of Object.entries(merged.groupRules)) {
 		merged.groupRules[chatId] = validateGroupRule(rule, `config.groupRules.${chatId}`);
@@ -258,6 +267,18 @@ export function loadConfig(homeDir: string, env: NodeJS.ProcessEnv = process.env
 		return { ...merged, sessionDir: alt.sessionDir };
 	}
 	return merged;
+}
+
+/**
+ * 页脚的最终开关：群级设置优先，其次全局默认。
+ *
+ * 单独抽出来是因为两处必须一致 —— 会话管理器（决定发不发页脚）与
+ * `/feishu footer` 命令（决定显示什么状态）。两处各写一份判断早晚会漂。
+ */
+export function resolveFooterEnabled(cfg: BridgeConfig, chatId: string): { enabled: boolean; source: "chat" | "global" } {
+	const override = cfg.footerByChat?.[chatId];
+	if (typeof override === "boolean") return { enabled: override, source: "chat" };
+	return { enabled: cfg.footer?.enabled !== false, source: "global" };
 }
 
 /**

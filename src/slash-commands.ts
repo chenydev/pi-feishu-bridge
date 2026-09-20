@@ -19,9 +19,11 @@ export const FEISHU_SLASH_COMMANDS: ReadonlyArray<SlashCommandHelp> = [
 	{ usage: "/workspace [别名]", description: "查看（任何人）或切换（仅管理员）受控工作区" },
 	{ usage: "/resume <选择 id>", description: "恢复 /sessions 列出的历史会话（忙碌时不可用）" },
 	{ usage: "/feishu status", description: "查看连接、会话、队列和 outbox 状态" },
+	{ usage: "/feishu usage", description: "本会话累计用量（token/费用/上下文占用）+ DeepSeek 账户余额与消耗速率" },
 	{ usage: "/feishu doctor", description: "运行飞书桥可解释诊断（积压/错误类别/限流/待审批）" },
 	{ usage: "/feishu export", description: "管理员导出脱敏诊断包（0600，仅计数与枚举）" },
 	{ usage: "/feishu policy <策略>", description: "管理员设置当前群策略" },
+	{ usage: "/feishu footer [on|off]", description: "管理员开关当前会话的页脚（默认开）" },
 	{ usage: "/feishu always [revoke <规则名>]", description: "管理员查看/撤销「始终批准」规则" },
 ];
 

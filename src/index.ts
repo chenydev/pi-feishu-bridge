@@ -8,7 +8,7 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "./pi-types.js";
 import type { BridgeConfig, BridgeStatus, GroupPolicy } from "./types.js";
 import { DEFAULT_CONFIG } from "./types.js";
-import { loadConfig, resolveAppLockFile, resolvePaths, saveConfig, formatTimeInZone } from "./config.js";
+import { loadConfig, resolveAppLockFile, resolvePaths, resolveFooterEnabled, saveConfig, formatTimeInZone } from "./config.js";
 import { FeishuTransport } from "./inbound/transport.js";
 import { InboundPipeline } from "./inbound/pipeline.js";
 import { LastSentCache, admit, effectiveAdmins } from "./inbound/admit.js";
@@ -36,6 +36,9 @@ import {
 import { classifyCommand } from "./approval/command-policy.js";
 import { buildApprovalCard, type ApprovalCardResolution } from "./approval/cards.js";
 import { buildModelStatusCard, buildModelsTable } from "./commands/models-card.js";
+import { buildUsageCard, formatUsageReport } from "./commands/usage-card.js";
+import { createBalanceClient, type BalanceResult } from "./outbound/deepseek-balance.js";
+import { pricingTierAt } from "./outbound/deepseek-usage.js";
 import { readGlobalDefaults, splitModelTarget, writeGlobalDefaults } from "./config/global-defaults.js";
 import {
 	ClarificationStore,
@@ -76,6 +79,8 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 	let outbox: Outbox | undefined;
 	let lastSent: LastSentCache | undefined;
 	let permissionBridge: PermissionBridge | undefined;
+	/** P1-03：DeepSeek 余额客户端（首次用到才建，避免启动时做外部请求）。 */
+	let balanceClient: ReturnType<typeof createBalanceClient> | undefined;
 	// pi-permission-system 父会话转发（实验性，默认关）：桥充当应答方，把 PS 的 ask 变成审批卡。
 	let psForwarding: PsForwardingServer | undefined;
 	/** 「始终批准」规则表（转发路径）；未启用时为 undefined。 */
@@ -248,6 +253,24 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		};
 	}
 
+	/**
+	 * P1-03：DeepSeek 余额（懒建客户端；失败降级为 unavailable，不抛异常）。
+	 *
+	 * 只在 `/feishu usage` 里调用，不打任何周期性外部请求；快照文件由
+	 * `usage.snapshots` 控制（关掉就只查余额、不估速率）。
+	 */
+	async function balanceFor(cfg: BridgeConfig): Promise<BalanceResult> {
+		if (!balanceClient) {
+			balanceClient = createBalanceClient({
+				apiKey: process.env.DEEPSEEK_API_KEY,
+				ttlMs: cfg.usage?.balanceTtlMs,
+				snapshotPath: cfg.usage?.snapshots === false ? undefined : resolvePaths(homeDir).balanceSnapshotsFile,
+				log: (level, message, meta) => log[level](message, meta),
+			});
+		}
+		return balanceClient.get();
+	}
+
 	async function handleFeishuCommand(msg: import("./types.js").FeishuInboundMessage): Promise<boolean> {
 		const raw = msg.text.trim();
 		const [command, ...args] = raw.split(/\s+/);
@@ -261,6 +284,33 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 		if (normalized === "/help" || normalized === "/commands"
 			|| (normalized === "/feishu" && args[0]?.toLowerCase() === "help")) {
 			reply(formatSlashCommandHelp());
+			return true;
+		}
+		if (normalized === "/feishu" && args[0]?.toLowerCase() === "usage") {
+			// 余额查询会打外部接口，所以走 TTL 缓存；失败也不阻止会话用量展示。
+			const tier = pricingTierAt(new Date());
+			const snapshot = convManager?.usageSnapshot(msg);
+			const balance = await balanceFor(config);
+			const input = {
+				...(snapshot ?? {}),
+				tier,
+				balance,
+				localTimeLabel: formatTimeInZone(Date.now(), config.timezone),
+			};
+			if (transport) {
+				try {
+					await transport.sendCard(msg.chatId, buildUsageCard(input), {
+						replyTo: msg.messageId,
+						threadId: msg.threadId,
+					});
+					return true;
+				} catch (error) {
+					log.warn("feishu.usage.card_failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			reply(formatUsageReport(input));
 			return true;
 		}
 		if (normalized === "/feishu" && args[0]?.toLowerCase() === "status") { reply(statusText()); return true; }
@@ -296,6 +346,42 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 				if (previous === undefined) delete config.groupPolicyByChat[msg.chatId];
 				else config.groupPolicyByChat[msg.chatId] = previous;
 				reply("策略落盘失败，运行态未修改");
+			}
+			return true;
+		}
+		if (normalized === "/feishu" && args[0]?.toLowerCase() === "footer") {
+			// 页脚是"给人看的元信息"，每个群的信息密度需求不同 —— 交给该群管理员当场决定，
+			// 而不是让所有人一起去改配置文件。缺省跟随全局 footer.enabled（默认开）。
+			const state = resolveFooterEnabled(config, msg.chatId);
+			const action = args[1]?.toLowerCase();
+			if (!action) {
+				reply([
+					`本会话页脚：${state.enabled ? "开" : "关"}（${state.source === "chat" ? "管理员设置" : "全局默认"}）`,
+					"用法：/feishu footer off 关闭本会话页脚；/feishu footer on 恢复显示（仅管理员或应用归属人）。",
+				].join("\n"));
+				return true;
+			}
+			if (action !== "on" && action !== "off") {
+				reply("用法：/feishu footer [on|off]");
+				return true;
+			}
+			if (!effectiveAdmins(config).includes(msg.senderId)) {
+				reply("仅管理员或应用归属人可修改本会话页脚设置");
+				return true;
+			}
+			const wanted = action === "on";
+			const previous = config.footerByChat?.[msg.chatId];
+			config.footerByChat = { ...(config.footerByChat ?? {}), [msg.chatId]: wanted };
+			if (saveConfig(homeDir, config)) {
+				log.info("feishu.footer.toggled", { chatId: msg.chatId, enabled: wanted, operator: msg.senderId });
+				reply(wanted
+					? "已开启本会话页脚（模型/耗时/上下文/累计用量/费用）。用 /feishu footer off 可关闭。"
+					: "已关闭本会话页脚。用 /feishu footer on 可恢复；/feishu usage 仍可随时查看完整用量。");
+			} else {
+				// 落盘失败就回滚运行态：否则重启后又变回去，用户以为设置没生效
+				if (previous === undefined) delete config.footerByChat[msg.chatId];
+				else config.footerByChat[msg.chatId] = previous;
+				reply("页脚设置落盘失败，运行态未修改");
 			}
 			return true;
 		}

@@ -889,3 +889,87 @@ test("/model 候选超过上限时截断并提示其余数量", async () => {
 	assert.match(out, /可切换（14）/);
 	assert.match(out, /其余 4 个/);
 });
+
+test("引用带页脚的消息：注入提示词里的页脚被剥干净（两种形态都覆盖）", async () => {
+	const prompts: string[] = [];
+	const backend: SessionBackend = {
+		async createSession() {
+			return {
+				sessionId: "sid-quote-footer",
+				async prompt(text) { prompts.push(text); return "done"; },
+				subscribe: () => () => {}, async abort() {}, async dispose() {}, modelId: "m",
+			};
+		},
+	};
+	const dir = mkdtempSync(join(tmpdir(), "feishu-quote-footer-"));
+	try {
+		const manager = new ConversationManager({
+			config: config(), sessionDir: dir, sessionBackend: backend, sender: sender([]) as never,
+		});
+		const plainFooter = [
+			"⚡ deepseek-flash · **1.5s** · 上下文 **2.1%（20.8k / 1.0M）**",
+			"📊 本会话 输入 **62.3k** = 未命中 **613** + 缓存命中 **61.7k**（**99.0%**） | 输出 **57**",
+			"💰 本会话 **<$0.01 / <¥0.01（估算）**",
+		].join("\n");
+		// 形态一：文本通道（无分割线）
+		await manager.route({ ...message("q1"), replyToMessageId: "om_parent", replyToText: `答案是 42。\n\n${plainFooter}` });
+		await waitUntil(() => prompts.length === 1);
+		assert.ok(prompts[0]!.includes("答案是 42。"), prompts[0]);
+		assert.ok(!prompts[0]!.includes("📊"), `页脚行不得进提示词：${prompts[0]}`);
+		assert.ok(!prompts[0]!.includes("本会话"), `页脚行不得进提示词：${prompts[0]}`);
+		assert.ok(!prompts[0]!.includes("deepseek-flash"), `页脚行不得进提示词：${prompts[0]}`);
+
+		// 形态二：旧版带分割线
+		await manager.route({ ...message("q2"), replyToMessageId: "om_parent2", replyToText: `答案是 42。\n\n———\n本轮 m · 1.0s · in 1 / out 1\n会话 in 2 / out 2` });
+		await waitUntil(() => prompts.length === 2);
+		assert.ok(!prompts[1]!.includes("———"), prompts[1]);
+		assert.ok(!prompts[1]!.includes("本轮"), `旧版页脚也不得进提示词：${prompts[1]}`);
+
+		// 形态三：整条都是页脚 → 注入占位提示，不塞空引用
+		await manager.route({ ...message("q3"), replyToMessageId: "om_parent3", replyToText: "📊 本会话 输入 1.0k | 输出 10" });
+		await waitUntil(() => prompts.length === 3);
+		assert.ok(prompts[2]!.includes("[无法获取被回复消息原文]"), prompts[2]);
+		assert.ok(!prompts[2]!.includes("本会话"), prompts[2]);
+	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("页脚群级开关：本群关了就不发页脚，别的群不受影响", async () => {
+	const backend = (): SessionBackend => ({
+		async createSession() {
+			return {
+				sessionId: "sid-footer-chat",
+				async prompt() { return "答案正文。"; },
+				subscribe: () => () => {}, async abort() {}, async dispose() {}, modelId: "deepseek-flash",
+			};
+		},
+	});
+	const footerCfg = { enabled: true, showCost: true, showCny: false, showContext: false, showSession: true };
+
+	// ① 本群显式关闭 → 只有正文（进度消息不算）
+	const sentOff: Array<{ chatId: string; text: string }> = [];
+	const dirOff = mkdtempSync(join(tmpdir(), "feishu-footer-off-"));
+	try {
+		const manager = new ConversationManager({
+			config: config({ footer: footerCfg, footerByChat: { oc_real_chat: false } }),
+			sessionDir: dirOff, sessionBackend: backend(), sender: sender(sentOff) as never,
+		});
+		await manager.route(message("footer-off"));
+		await waitUntil(() => sentOff.some((m) => m.text.includes("答案正文。")));
+		// 文本通道不带分割线（那是卡片里的 hr），所以按页脚行特征判断
+		assert.ok(sentOff.every((m) => !m.text.includes("⚡") && !m.text.includes("本会话")), `群级关闭后任何消息都不得带页脚：${JSON.stringify(sentOff)}`);
+	} finally { rmSync(dirOff, { recursive: true, force: true }); }
+
+	// ② 关的是别的群 → 本群照发（同时验证开关是"按群"的，不是全局一刀切）
+	const sentOn: Array<{ chatId: string; text: string }> = [];
+	const dirOther = mkdtempSync(join(tmpdir(), "feishu-footer-other-"));
+	try {
+		const manager = new ConversationManager({
+			config: config({ footer: footerCfg, footerByChat: { oc_other: false } }),
+			sessionDir: dirOther, sessionBackend: backend(), sender: sender(sentOn) as never,
+		});
+		await manager.route(message("footer-on"));
+		await waitUntil(() => sentOn.some((m) => m.text.includes("答案正文。")));
+		const body = sentOn.find((m) => m.text.includes("答案正文。"))!.text;
+		assert.ok(body.includes("⚡ deepseek-flash"), `别的群的设置不该影响本群：${body}`);
+	} finally { rmSync(dirOther, { recursive: true, force: true }); }
+});

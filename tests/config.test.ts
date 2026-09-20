@@ -118,3 +118,27 @@ test("时区：formatTimeInZone 按指定时区格式化，且无效时区不抛
 	// 无效时区退回系统默认，但不抛
 	assert.doesNotThrow(() => formatTimeInZone(noon, "Bad/Zone"));
 });
+
+test("页脚群级开关：群级优先于全局，缺省跟随全局，非法值直接报错", async () => {
+	const { resolveFooterEnabled, loadConfig, saveConfig } = await import("../src/config.js");
+	const { DEFAULT_CONFIG } = await import("../src/types.js");
+	const base = { ...DEFAULT_CONFIG, footer: { ...DEFAULT_CONFIG.footer, enabled: true } };
+	assert.deepEqual(resolveFooterEnabled(base, "oc_a"), { enabled: true, source: "global" });
+	assert.deepEqual(resolveFooterEnabled({ ...base, footerByChat: { oc_a: false } }, "oc_a"), { enabled: false, source: "chat" });
+	assert.deepEqual(resolveFooterEnabled({ ...base, footerByChat: { oc_a: false } }, "oc_b"), { enabled: true, source: "global" }, "别的群不受影响");
+	assert.deepEqual(resolveFooterEnabled({ ...base, footer: { ...base.footer, enabled: false }, footerByChat: { oc_a: true } }, "oc_a"),
+		{ enabled: true, source: "chat" }, "全局关掉后，群级仍可单独打开");
+
+	// 落盘 + 重新加载：设置必须活过重启
+	const dir = mkdtempSync(join(tmpdir(), "feishu-footer-cfg-"));
+	try {
+		const cfg = { ...base, footerByChat: { oc_a: false } };
+		assert.equal(saveConfig(dir, cfg), true);
+		const reloaded = loadConfig(dir, {});
+		assert.deepEqual(reloaded.footerByChat, { oc_a: false });
+
+		// 非法值不能被静默当成默认值
+		writeFileSync(join(dir, "feishu-bridge", "config.json"), JSON.stringify({ ...base, footerByChat: { oc_a: "yes" } }));
+		assert.throws(() => loadConfig(dir, {}), /footerByChat\.oc_a 必须是 true\/false/);
+	} finally { rmSync(dir, { recursive: true, force: true }); }
+});

@@ -233,6 +233,9 @@ export class FeishuTransport {
 			try {
 				const parsed = JSON.parse(content) as Record<string, unknown>;
 				if (typeof parsed.text === "string" && parsed.text.trim()) return parsed.text;
+				// 卡片消息：正文在卡片里，从 API 拿不到（只拿到 card_id 引用）。
+				// 返回 undefined 让上层给一句短提示，而不是把卡片 JSON 整块喂进提示词。
+				if (parsed.type === "card") return undefined;
 			} catch {
 				/* fallthrough */
 			}

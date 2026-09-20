@@ -3,7 +3,7 @@
  * 设计依据：docs/DESIGN.md §3.4；API 契约见 DESIGN §7.2（只使用官方导出）。
  */
 import { join } from "node:path";
-import type { PiImageContent, SessionBackend } from "../types.js";
+import type { PiImageContent, PiSessionStats, SessionBackend } from "../types.js";
 import { stripGatewayExtensions, type ExtensionDiscoveryResult, type InlineBridgeExtension } from "./pi-bridge-hooks.js";
 
 interface PiSdk {
@@ -56,6 +56,8 @@ interface PiAgentSession {
 	/** P1-04：会话名称（Pi transcript 中的 session_info）。 */
 	sessionName?: string;
 	setSessionName?(name: string): void;
+	/** P1-03：会话统计（含 tokens/cost/contextUsage）；老 SDK 可能没有。 */
+	getSessionStats?(): PiSessionStats;
 }
 
 export interface PiSessionBackendDeps {
@@ -141,6 +143,8 @@ export class PiSessionBackend implements SessionBackend {
 			listSessions(): Promise<Array<{ path: string; id: string; name?: string; modified: number; messageCount: number }>>;
 			sessionName(): string | undefined;
 			setSessionName(name: string): void;
+			/** P1-03：会话累计统计（token/费用/上下文占用）。 */
+			getSessionStats(): PiSessionStats | undefined;
 	}> {
 		const sdk = await this.ensureSdk();
 		// P2-02：按会话传入的 cwd（默认进程 cwd）；不修改 process.cwd()
@@ -235,6 +239,11 @@ export class PiSessionBackend implements SessionBackend {
 			},
 			setSessionName(name) {
 				agentSession.setSessionName?.(name);
+			},
+			// P1-03：会话累计统计（token/费用/上下文占用）。
+			// 每次调用都是一次全量扫描，但只在 run 结束与用户主动查用量时发生，频率极低。
+			getSessionStats() {
+				try { return agentSession.getSessionStats?.(); } catch { return undefined; }
 			},
 		};
 	}

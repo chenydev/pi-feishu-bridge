@@ -25,7 +25,16 @@
 - **澄清选择卡**：Agent 可就地提问并给出选项，超时或越权自动回退为文本
 - **流式输出**：内置文本流式（默认）；可选 CardKit 流式卡片（需应用权限，见下）
 - **进度与思考**：工具名 + 耗时 + 脱敏命令摘要，工具风暴自动折叠
-- **页脚指标**：模型 · 耗时 · in/out tokens · cache · 费用（估算）
+- **页脚指标**（卡片里是**独立一块**：分割线 + 小号淡色）：
+  ```
+  本轮 deepseek-flash · 1.8s · in 251 / out 21 · cache 20.5k · <$0.01 / <¥0.01（估算）
+  会话 in 67.4k / out 9.4k · cache 514.7k · ctx 2.1%（20.8k/1.0M） · $0.02 / ¥0.13（估算）
+  ```
+  - **本轮**＝这一轮花的（跨工具多轮累加）；**会话**＝本次聊天累计 + 当前上下文占用
+  - 费用 2 位小数；不足一分钱显示 `<$0.01`（不显示假 0）；¥ 由**官方 CNY 价表**推导（不是汇率），模型不在价表内时只显示 `$`
+  - 开关：`footer.showCost` / `showCny` / `showContext` / `showSession`（`showSession:false` 只留本轮）
+  - **群级开关**：`/feishu footer off`（管理员/应用归属人）关掉当前会话的页脚，`/feishu footer on` 恢复，`/feishu footer` 查看状态；
+    落盘在 `config.json` 的 `footerByChat`（缺省跟随全局 `footer.enabled`，默认开）。页脚只进**出站消息**，不进会话历史/上下文
 
 ### 命令
 
@@ -38,6 +47,8 @@
 | `/model` `/models` `/thinking` | 切换模型与思考强度 |
 | `/workspace` | 切换工作区（白名单别名） |
 | `/feishu status` `/feishu policy` `/feishu export` | 状态、群策略、脱敏诊断包导出 |
+| `/feishu usage` | 本会话累计用量（输入=未命中+缓存命中、命中率、上下文占用、费用）+ DeepSeek 账户余额、消耗速率与预计可用时长 |
+| `/feishu footer [on\|off]` | 管理员开关**当前会话**的页脚（默认开，落盘 `footerByChat`，活过重启） |
 | `/feishu always [revoke <规则名>]` | 管理员查看/撤销「始终批准」规则（转发路径的持久放行） |
 
 ### 触发与准入
