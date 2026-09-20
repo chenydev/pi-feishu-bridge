@@ -365,7 +365,22 @@ export class FeishuTransport {
 		const action = (outer.action ?? {}) as Record<string, unknown>;
 		const messageId = context.open_message_id ?? context.message_id ?? outer.open_message_id;
 		const operatorOpenId = operator.open_id;
-		if (typeof messageId !== "string" || typeof operatorOpenId !== "string") return undefined;
+		// 解析失败时**必须留痕**：静默 return 会让"按钮点了没反应"完全无法排障
+		// （分不清是飞书没推、还是字段名对不上）。只记结构不记内容。
+		if (typeof messageId !== "string" || typeof operatorOpenId !== "string") {
+			this.deps.log?.("warn", "feishu.transport.card_action_unparsable", {
+				topKeys: Object.keys(outer).slice(0, 10),
+				contextKeys: Object.keys(context).slice(0, 10),
+				operatorKeys: Object.keys(operator).slice(0, 6),
+				hasMessageId: typeof messageId === "string",
+				hasOperator: typeof operatorOpenId === "string",
+			});
+			return undefined;
+		}
+		this.deps.log?.("debug", "feishu.transport.card_action", {
+			messageId,
+			hasValue: action.value !== undefined, op: (action.value as Record<string, unknown> | undefined)?.op,
+		});
 		const rawChatId = context.open_chat_id ?? context.chat_id ?? outer.open_chat_id;
 		return this.deps.onCardAction?.({
 			messageId,

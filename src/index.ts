@@ -35,7 +35,7 @@ import {
 } from "./approval/ps-forwarding.js";
 import { classifyCommand } from "./approval/command-policy.js";
 import { buildApprovalCard, type ApprovalCardResolution } from "./approval/cards.js";
-import { buildModelsCard, buildModelsCardResolved } from "./commands/models-card.js";
+import { buildModelStatusCard, buildModelsTable } from "./commands/models-card.js";
 import {
 	ClarificationStore,
 	buildClarificationCard,
@@ -161,25 +161,48 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 
 	async function handleCardAction(action: CardAction): Promise<unknown> {
 		const value = action.value ?? {};
-		// 模型卡片：翻页（原地重渲染同一张卡）
-		if (value.op === "models") {
-			if (typeof value.page !== "number" || typeof value.conversationKey !== "string") return undefined;
-			const data = await convManager?.modelsCardDataByKey(value.conversationKey);
-			if (!data) return { toast: { type: "warning", content: "该会话已失效，请重新发送 /models" } };
-			return { card: { type: "raw", data: buildModelsCard({ ...data, page: value.page }) } };
-		}
-		// 模型卡片：切换（只信 id/provider，执行前仍按会话归属校验）
-		if (value.op === "models.pick") {
-			if (typeof value.id !== "string" || typeof value.conversationKey !== "string") return undefined;
-			const target = typeof value.provider === "string" ? `${value.provider}/${value.id}` : value.id;
-			const result = await convManager?.setModelByKey(value.conversationKey, target);
-			if (!result) return { toast: { type: "warning", content: "无法切换：会话不存在或正在执行任务" } };
-			if (!result.ok) return { toast: { type: "warning", content: result.reason } };
-			const data = result.data;
+		log.info("feishu.card.action", {
+			messageId: action.messageId, op: typeof value.op === "string" ? value.op : null,
+			operator: action.operatorOpenId, hasValue: action.value !== undefined,
+		});
+		// 模型列表卡片是**纯展示**的（表格自带客户端分页），没有回调分支 ——
+		// 切换模型走 /model <provider>/<id> 命令，不把列表变成表单。
+
+		// /model 状态卡：点档位按钮即切换思考等级（等价于 /thinking <level>），
+		// 然后原地刷新卡片 —— 按钮的勾与禁用态要跟着变，否则用户会以为没生效。
+		if (value.op === "thinking.set") {
+			if (typeof value.level !== "string" || typeof value.conversationKey !== "string") return undefined;
+			const result = await convManager?.setThinkingByKey(value.conversationKey, value.level);
+			if (!result?.ok) {
+				log.warn("feishu.card.thinking_set_failed", { level: value.level, reason: result?.reason ?? "unknown" });
+				return { toast: { type: "warning", content: result?.reason ?? "切换失败" } };
+			}
+			log.info("feishu.card.thinking_set", { level: value.level, conversationKey: value.conversationKey });
+			const data = await convManager?.modelStatusCardDataByKey(value.conversationKey);
+			if (!data) return { toast: { type: "success", content: `已切换到 ${value.level}` } };
 			return {
-				toast: { type: "success", content: `已切换到 ${target}` },
-				card: { type: "raw", data: buildModelsCardResolved({ ...data, page: 0 }, target, true, "") },
+				toast: { type: "success", content: `已切换到 ${value.level}` },
+				card: { type: "raw", data: buildModelStatusCard(data) },
 			};
+		}
+
+		// /model 状态卡的「查看全部模型」：等价于执行 /models —— **发一张新卡片**
+		// 而不是原地替换，那样会把状态卡覆盖掉，用户就失去了回到档位按钮的入口。
+		if (value.op === "models.open") {
+			if (typeof value.conversationKey !== "string") return undefined;
+			const data = await convManager?.modelsTableDataByKey(value.conversationKey);
+			if (!data) {
+				log.warn("feishu.card.models_open_failed", { conversationKey: value.conversationKey });
+				return { toast: { type: "warning", content: "会话已失效，请重新发送 /models" } };
+			}
+			log.info("feishu.card.models_open", { conversationKey: value.conversationKey });
+			if (!action.chatId) return { toast: { type: "warning", content: "无法确定目标会话" } };
+			try {
+				await transport?.sendCard(action.chatId, buildModelsTable(data));
+				return { toast: { type: "success", content: "已发送模型列表" } };
+			} catch (error) {
+				return { toast: { type: "warning", content: `发送失败：${error instanceof Error ? error.message.slice(0, 60) : "未知错误"}` } };
+			}
 		}
 		// P2-01：澄清选择 —— 只恢复等待点，不写任何授权
 		if (value.op === "clarify") {
@@ -323,20 +346,34 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			return true;
 		}
 		if (normalized === "/compact") { reply(await convManager?.compactConversation(msg, args.join(" ") || undefined) ?? "会话不可用"); return true; }
-		if (normalized === "/model") { reply(await convManager?.modelConversation(msg, args[0]) ?? "会话不可用"); return true; }
+		if (normalized === "/model") {
+			// 无参 = 状态卡（当前模型 + 档位按钮 + 「查看全部模型」按钮）。
+			// 带参仍是命令式切换，保持文本回执 —— 那是一次性动作，不需要卡片。
+			if (!args[0] && transport) {
+				const data = await convManager?.modelStatusCardData(msg);
+				if (data) {
+					await transport.sendCard(msg.chatId, buildModelStatusCard(data), {
+						replyTo: msg.messageId,
+						threadId: msg.threadId,
+					});
+					return true;
+				}
+			}
+			reply(await convManager?.modelConversation(msg, args[0]) ?? "会话不可用");
+			return true;
+		}
 		if (normalized === "/models") {
-			const page = Number.parseInt(args[0] ?? "0", 10);
-			const requested = Number.isFinite(page) ? page : 0;
-			// 卡片：可原地翻页 + 点击切换模型。取不到数据时回退文本分页（保证可用性）。
+			// 表格卡片：飞书客户端自带分页（page_size），不需要服务端翻页回调，
+			// 因此也不再接受页码参数 —— 翻页是客户端行为。
 			const data = await convManager?.modelsCardData(msg);
 			if (data && transport) {
-				await transport.sendCard(msg.chatId, buildModelsCard({ ...data, page: requested }), {
+				await transport.sendCard(msg.chatId, buildModelsTable(data), {
 					replyTo: msg.messageId,
 					threadId: msg.threadId,
 				});
 				return true;
 			}
-			reply(await convManager?.listModels(msg, requested) ?? "会话不可用");
+			reply(await convManager?.listModels(msg, 0) ?? "会话不可用");
 			return true;
 		}
 		if (normalized === "/sessions") {

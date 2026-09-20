@@ -1,110 +1,227 @@
 /**
- * 模型列表卡片：把 /models 的纯文本分页换成可点按的卡片。
+ * 模型列表卡片：把 /models 的纯文本分页换成**表格卡片**。
  *
- * 为什么用卡片：模型常有几十个，纯文本一次只能列一页，翻页要靠输入
- * `/models 1`、`/models 2`；卡片可以原地翻页，并让「切换」变成一次点击。
+ * 为什么是表格而不是按钮列表：模型常有几十个，「有哪些」是查看型需求，
+ * 不是选择型需求 —— 切换模型本来就有 /model <provider>/<id> 命令。
+ * 用按钮把列表变成表单反而逼着用户去点，而我们要的是**能看清、能复制**。
  *
- * 回调契约（与审批卡/澄清卡一致，见 src/index.ts 的 handleCardAction）：
- *   { op: "models", page, conversationKey }
- *   { op: "models.pick", provider, id, conversationKey } —— 直接切换到某个模型
- *   （两个 op 都带 conversationKey：回调不必重建 key，避免按 chatId 猜测用户身份）
+ * 分页由飞书客户端完成（table 组件的 page_size），**不经过服务端回调**：
+ * 老实现靠按钮回调 + 按 conversationKey 查内存会话，会话被空闲回收后翻页就失效；
+ * 表格分页没有这个问题，也不需要我们在 value 里塞会话标识。
  *
- * 安全：卡片只发到发起命令的那个会话，value 里带的 conversationKey 同样是
- * 该会话自己的 key，不构成跨会话信息泄露。真正的切换动作仍由桥在回调里
- * 校验会话归属后执行（见 index.ts），不信任客户端传入的任意模型名以外的内容。
+ * 单元格用纯文本（data_type: "text"）而非 markdown 反引号：实测两者都能正常
+ * 选中复制，纯文本在移动端的排版更紧凑。
  */
 
 export interface ModelEntry {
 	id: string;
 	provider?: string;
+	/** 显示名（可选：不是所有模型来源都提供）。 */
+	name?: string;
 }
 
-export interface ModelsCardInput {
+export interface ModelsTableInput {
 	models: ModelEntry[];
 	currentId: string;
-	page: number;
-	/** 每页条数。卡片比纯文本更占高度，默认比文本分页小。 */
+	/** 每页行数。table 组件的 page_size，客户端翻页用。 */
 	pageSize?: number;
-	/** 回调时用于定位会话（卡片发到哪个会话，就带哪个 key）。 */
-	conversationKey: string;
 }
 
-export const MODELS_PAGE_SIZE = 8;
+export const MODELS_TABLE_PAGE_SIZE = 10;
+
+/** 状态卡里档位按钮每行放几个（固定等宽，放不下换行）。 */
+export const THINKING_LEVELS_PER_ROW = 3;
 
 /** provider/id 形式（同一 id 可能来自不同 provider，必须带前缀才能无歧义）。 */
 export function modelLabel(entry: ModelEntry): string {
 	return entry.provider ? `${entry.provider}/${entry.id}` : entry.id;
 }
 
-export function buildModelsCard(input: ModelsCardInput): unknown {
-	const pageSize = input.pageSize ?? MODELS_PAGE_SIZE;
-	const total = input.models.length;
-	const pages = Math.max(1, Math.ceil(total / pageSize));
-	const page = Math.min(Math.max(0, input.page), pages - 1);
-	const slice = input.models.slice(page * pageSize, page * pageSize + pageSize);
-
-	const elements: unknown[] = [];
-
-	// 当前模型单独一行置顶，翻页时始终可见
+export function buildModelsTable(input: ModelsTableInput): unknown {
+	const pageSize = input.pageSize ?? MODELS_TABLE_PAGE_SIZE;
 	const current = input.models.find((m) => m.id === input.currentId);
-	elements.push({
-		tag: "markdown",
-		content: `当前：**${current ? modelLabel(current) : input.currentId}**`,
-	});
 
-	for (const entry of slice) {
-		const isCurrent = entry.id === input.currentId;
-		elements.push({
-			tag: "button",
-			text: { tag: "plain_text", content: isCurrent ? `✓ ${modelLabel(entry)}` : modelLabel(entry) },
-			type: isCurrent ? "primary" : "default",
-			width: "fill",
-			...(isCurrent ? { disabled: true } : {}),
-			value: { op: "models.pick", provider: entry.provider, id: entry.id, conversationKey: input.conversationKey },
-		});
-	}
+	const rows = input.models.map((entry) => ({
+		model: modelLabel(entry),
+		...(entry.name ? { name: entry.name } : {}),
+	}));
 
-	// 翻页行：只有多于一页时才出现，避免单页场景多两个无用按钮
-	if (pages > 1) {
-		const nav = (label: string, target: number, disabled: boolean) => ({
-			tag: "button",
-			text: { tag: "plain_text", content: label },
-			type: "default" as const,
-			width: "fill",
-			disabled,
-			value: { op: "models", page: target, conversationKey: input.conversationKey },
-		});
-		elements.push(nav(`← 上一页（${page === 0 ? 1 : page} / ${pages}）`, page - 1, page === 0));
-		elements.push(nav(`下一页（${page + 2 > pages ? pages : page + 2} / ${pages}）`, page + 1, page + 1 >= pages));
-	}
+	// 名称列只在真的有数据时出现 —— 全空的一列比没有这一列更难看。
+	const hasName = rows.some((row) => row.name !== undefined);
+	const columns = [
+		{ name: "model", display_name: "模型（provider/model）", data_type: "text", width: "auto" },
+		...(hasName ? [{ name: "name", display_name: "名称", data_type: "text", width: "auto" }] : []),
+	];
 
 	return {
 		schema: "2.0",
+		config: { wide_screen_mode: true },
 		header: {
-			title: { tag: "plain_text", content: `可用模型（${total}）` },
-			subtitle: { tag: "plain_text", content: `第 ${page + 1}/${pages} 页` },
+			title: { tag: "plain_text", content: `可用模型（${input.models.length}）` },
 			template: "blue",
 		},
-		body: { elements },
+		body: {
+			elements: [
+				{
+					tag: "markdown",
+					content: `当前：**${current ? modelLabel(current) : input.currentId}**\n`
+						+ "切换用 `/model <provider>/<模型>`。表格可翻页，单元格可直接选中复制。",
+				},
+				{
+					tag: "table",
+					page_size: pageSize,
+					row_height: "low",
+					header_style: {
+						text_align: "left",
+						text_size: "normal",
+						background_style: "grey",
+						text_color: "default",
+						bold: true,
+					},
+					columns,
+					rows,
+				},
+			],
+		},
 	};
 }
 
-/** 点击某个模型后原地替换的卡片：标题改成结论，其余按钮禁用。 */
-export function buildModelsCardResolved(input: ModelsCardInput, label: string, ok: boolean, reason: string): unknown {
-	const base = buildModelsCard(input) as { header: Record<string, unknown>; body: { elements: unknown[] } };
-	const elements = base.body.elements.map((el) => {
-		const node = el as Record<string, unknown>;
-		if (node.tag !== "button") return node;
-		return { ...node, disabled: true, type: "default" };
+// ────────────────────────────────────── /model 状态卡 ────────────────────
+
+export interface ModelStatusInput {
+	/** 当前模型（已尽量补上 provider 前缀，便于直接复制）。 */
+	currentLabel: string;
+	thinkingLevel?: string;
+	/** 可用档位（来自 agent.availableThinkingLevels()）。 */
+	availableLevels?: string[];
+	/** 回调时用于定位会话（卡片发到哪个会话，就带哪个 key）。 */
+	conversationKey: string;
+}
+
+/** 两列 key-value（column_set）：标签与值严格左对齐，比全角空格排版可靠。 */
+function kvRow(label: string, value: string, bold = false): unknown {
+	return {
+		tag: "column_set",
+		flex_mode: "none",
+		horizontal_spacing: "default",
+		columns: [
+			{
+				tag: "column",
+				width: "weighted",
+				weight: 1,
+				elements: [{ tag: "markdown", content: label, text_align: "left" }],
+			},
+			{
+				tag: "column",
+				width: "weighted",
+				weight: 3,
+				elements: [{ tag: "markdown", content: bold ? `**${value}**` : value, text_align: "left" }],
+			},
+		],
+	};
+}
+
+/**
+ * 状态卡：只回答「我现在用什么、怎么换」，不重复候选列表（那在 /models 里）。
+ *
+ * 两个按钮都是**动作**而非状态展示：
+ * - 档位按钮：点一下切换思考等级（等价于 /thinking <level>）
+ * - 「查看全部模型」：点一下触发 /models 的效果（发一张模型表格卡片）
+ *
+ * ⚠️ 按钮回调要按 conversationKey 找回会话，因此**会话被空闲回收后点击会失效**
+ * （与旧的 /models 翻页按钮同一限制）。表格分页没这个问题，因为它在客户端完成。
+ */
+export function buildModelStatusCard(input: ModelStatusInput): unknown {
+	const elements: unknown[] = [
+		{ tag: "markdown", content: `**${input.currentLabel}**` },
+		{ tag: "hr" },
+	];
+
+	// 档位：一行标签 + 一排按钮。当前档位禁用并打勾，避免"点了没变化"的困惑。
+	const levels = input.availableLevels ?? [];
+	if (input.thinkingLevel) {
+		if (levels.length > 0) {
+			elements.push(kvRow("思考等级", input.thinkingLevel, true));
+			// 档位排版：标签独占一行，按钮**每行 3 个**（等宽），放不下的换行。
+			//
+			// 不把标签和按钮塞在同一行：pi 最多 6 档（minimal/low/medium/high/max/xhigh），
+			// 一行平分下来每个按钮只剩一两个字母宽，手机端没法点。
+			// 也不用 flex_mode:"flow" 自动换行：那会让按钮宽度随文字长短参差
+			// （"xhigh" 比 "low" 宽），六个按钮排起来很乱；固定 3 列等宽更像一组。
+			//
+			// 注意**不要嵌套 column_set**（column 里再放 column_set）：飞书会拒卡
+			// （230099 / ErrPath: ...(tag: column_set); ErrMsg: invalid width）。
+			// L3 方案是在顶层平铺多行 column_set，不涉及嵌套。
+			elements.push({ tag: "markdown", content: "可选档位" });
+			const PER_ROW = THINKING_LEVELS_PER_ROW;
+			for (let i = 0; i < levels.length; i += PER_ROW) {
+				const row = levels.slice(i, i + PER_ROW);
+				const columns: unknown[] = [{
+					// 占位列：让按钮与上面的「思考等级」值列左对齐
+					tag: "column", width: "weighted", weight: 1,
+					elements: [{ tag: "markdown", content: " " }],
+				}];
+				for (const level of row) {
+					columns.push({
+						tag: "column", width: "weighted", weight: 1,
+						elements: [{
+							tag: "button",
+							size: "small",
+							// 有颜色的才是可点的：可点 = primary（蓝），当前 = default（灰）+ 禁用 + 勾。
+							// 反过来（当前蓝、可点灰）会让灰色按钮看着像不可点，正是要避免的。
+							type: level === input.thinkingLevel ? "default" : "primary",
+							disabled: level === input.thinkingLevel,
+							text: {
+								tag: "plain_text",
+								content: level === input.thinkingLevel ? `✓ ${level}` : level,
+							},
+							value: { op: "thinking.set", level, conversationKey: input.conversationKey },
+						}],
+					});
+				}
+				// 末行不足时补空列，保持与上一行等宽（否则最后一行的按钮会被拉伸）
+				for (let k = row.length; k < PER_ROW; k++) {
+					columns.push({
+						tag: "column", width: "weighted", weight: 1,
+						elements: [{ tag: "markdown", content: " " }],
+					});
+				}
+				elements.push({
+					tag: "column_set", flex_mode: "none", horizontal_spacing: "small", columns,
+				});
+			}
+		} else {
+			// 模型不支持推理时不显示空按钮组 —— 一张空的按钮行比没有更让人困惑
+			elements.push(kvRow("思考等级", `${input.thinkingLevel}（当前模型无可用档位）`));
+		}
+	}
+
+	elements.push({ tag: "hr" });
+	elements.push({
+		tag: "column_set",
+		flex_mode: "none",
+		horizontal_spacing: "default",
+		columns: [
+			{
+				tag: "column", width: "weighted", weight: 1,
+				elements: [{ tag: "markdown", content: "模型列表", text_align: "left" }],
+			},
+			{
+				tag: "column", width: "weighted", weight: 3,
+				elements: [{
+					tag: "button", size: "small", type: "primary",
+					text: { tag: "plain_text", content: "/models" },
+					value: { op: "models.open", conversationKey: input.conversationKey },
+				}],
+			},
+		],
 	});
-	elements.splice(1, 0, { tag: "markdown", content: ok ? `已切换到 **${label}**` : reason });
+	elements.push(kvRow("切换模型", "`/model <provider>/<模型>`"));
+
 	return {
 		schema: "2.0",
-		header: {
-			title: { tag: "plain_text", content: `可用模型（${input.models.length}）` },
-			subtitle: { tag: "plain_text", content: ok ? `已切换到 ${label}` : reason },
-			template: ok ? "green" : "red",
-		},
+		config: { wide_screen_mode: true },
+		header: { title: { tag: "plain_text", content: "模型" }, template: "blue" },
 		body: { elements },
 	};
 }

@@ -865,43 +865,7 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		}
 	}
 
-	/** 卡片翻页：按 conversationKey 重建数据（key 由卡片回调带回，不猜用户身份）。 */
-	async modelsCardDataByKey(conversationKey: string): Promise<{
-		models: Array<{ id: string; provider?: string }>; currentId: string; conversationKey: string;
-	} | null> {
-		const session = this.sessions.get(conversationKey);
-		if (!session) return null;
-		const agent = session.agent ?? await this.ensureAgentSession(session).catch(() => undefined);
-		if (!agent?.listModels) return null;
-		try {
-			const models = await agent.listModels();
-			if (models.length === 0) return null;
-			return { models, currentId: agent.modelId, conversationKey };
-		} catch {
-			return null;
-		}
-	}
 
-	/** 卡片点击切换：按 key 找到会话并切换模型（target 形如 provider/id 或 id）。 */
-	async setModelByKey(conversationKey: string, target: string): Promise<{
-		ok: boolean; reason: string;
-		data: { models: Array<{ id: string; provider?: string }>; currentId: string; conversationKey: string };
-	} | null> {
-		const session = this.sessions.get(conversationKey);
-		if (!session) return null;
-		if (session.activeRun) return { ok: false, reason: "当前会话仍在执行，请稍后切换模型", data: (await this.modelsCardDataByKey(conversationKey))! };
-		let agent: AgentHandle;
-		try {
-			agent = session.agent ?? await this.ensureAgentSession(session);
-		} catch {
-			return null;
-		}
-		if (!agent.setModel) return { ok: false, reason: "当前 Pi 版本不支持远程切换模型", data: (await this.modelsCardDataByKey(conversationKey))! };
-		const ok = await agent.setModel(target);
-		const data = await this.modelsCardDataByKey(conversationKey);
-		if (!data) return null;
-		return { ok, reason: ok ? "" : `找不到已认证模型：${target}`, data };
-	}
 
 	async listModels(msg: FeishuInboundMessage, page = 0): Promise<string> {
 		const key = buildConversationKey(msg, this.deps.config);
@@ -1224,6 +1188,114 @@ ${lines.join("\n")}` : "🤖 正在处理…";
 		}
 		lines.push("", "切换：/model <模型>　查看全部：/models　思考等级：/thinking");
 		return lines.join("\n");
+	}
+
+	/**
+	 * 状态卡的数据源（/model 无参）。
+	 *
+	 * 当前模型要尽量带上 provider 前缀：`agent.modelId` 是**裸 id**，而 /models
+	 * 表格里是 `provider/id` —— 两边不一致会让人以为不是一个模型，而且带前缀
+	 * 才能直接复制进 `/model` 命令。
+	 *
+	 * 反查有歧义时**返回裸 id 而不猜**：猜错会让人复制一个错误的模型名去切换，
+	 * 比不显示前缀更糟。
+	 */
+	async modelStatusCardData(msg: FeishuInboundMessage): Promise<{
+		currentLabel: string;
+		thinkingLevel?: string;
+		availableLevels: string[];
+		conversationKey: string;
+	} | null> {
+		const key = buildConversationKey(msg, this.deps.config);
+		const session = this.getOrCreateSession(msg, key);
+		let agent: AgentHandle;
+		try {
+			agent = await this.ensureAgentSession(session);
+		} catch (error) {
+			this.deps.log?.("error", "feishu.conv.model_status_init_failed", {
+				conversationKey: key, error: error instanceof Error ? error.message : String(error),
+			});
+			return null;
+		}
+
+		let currentLabel = agent.modelId;
+		try {
+			const all = (await agent.listModels?.()) ?? [];
+			const matches = all.filter((entry) => entry.id === agent.modelId);
+			const only = matches.length === 1 ? matches[0] : undefined;
+			if (only?.provider) currentLabel = `${only.provider}/${only.id}`;
+		} catch {
+			// 列不出模型不影响展示当前模型（provider 暂时不可达时也一样）
+		}
+
+		const thinkingLevel = agent.thinkingLevel?.();
+		const availableLevels = agent.availableThinkingLevels?.() ?? [];
+		return {
+			currentLabel,
+			...(thinkingLevel ? { thinkingLevel } : {}),
+			availableLevels,
+			conversationKey: key,
+		};
+	}
+
+	/** 按钮回调用：按 key 取状态卡数据（回调里没有 inbound 消息，拿不到 chatId）。 */
+	async modelStatusCardDataByKey(conversationKey: string): Promise<{
+		currentLabel: string;
+		thinkingLevel?: string;
+		availableLevels: string[];
+		conversationKey: string;
+	} | null> {
+		const session = this.sessions.get(conversationKey);
+		if (!session?.agent) return null;
+		const agent = session.agent;
+
+		let currentLabel = agent.modelId;
+		try {
+			const all = (await agent.listModels?.()) ?? [];
+			const matches = all.filter((entry) => entry.id === agent.modelId);
+			const only = matches.length === 1 ? matches[0] : undefined;
+			if (only?.provider) currentLabel = `${only.provider}/${only.id}`;
+		} catch {
+			// 反查失败就用裸 id（不猜 provider）
+		}
+		const thinkingLevel = agent.thinkingLevel?.();
+		return {
+			currentLabel,
+			...(thinkingLevel ? { thinkingLevel } : {}),
+			availableLevels: agent.availableThinkingLevels?.() ?? [],
+			conversationKey,
+		};
+	}
+
+	/** 按钮回调用：按 key 取模型表格数据（「查看全部模型」按钮）。 */
+	async modelsTableDataByKey(conversationKey: string): Promise<{
+		models: Array<{ id: string; provider?: string }>; currentId: string;
+	} | null> {
+		const session = this.sessions.get(conversationKey);
+		if (!session?.agent?.listModels) return null;
+		try {
+			const models = await session.agent.listModels();
+			if (models.length === 0) return null;
+			return { models, currentId: session.agent.modelId };
+		} catch {
+			return null;
+		}
+	}
+
+	/** 按钮回调：按会话 key 切换思考等级（等价于 /thinking <level>）。 */
+	async setThinkingByKey(conversationKey: string, level: string): Promise<{ ok: boolean; reason?: string }> {
+		const session = this.sessions.get(conversationKey);
+		if (!session?.agent) return { ok: false, reason: "会话已失效，请重新发送 /model" };
+		const available = session.agent.availableThinkingLevels?.() ?? [];
+		if (available.length > 0 && !available.includes(level)) {
+			return { ok: false, reason: `当前模型不支持档位 ${level}` };
+		}
+		try {
+			session.agent.setThinkingLevel?.(level);
+			return { ok: true };
+		} catch (error) {
+			return { ok: false, reason: error instanceof Error ? error.message.slice(0, 80) : "切换失败" };
+		}
 	}
 
 	private getOrCreateSession(msg: FeishuInboundMessage, key: string): BridgeSession {

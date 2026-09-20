@@ -1,80 +1,231 @@
 /**
- * /models 卡片：分页、切换按钮、回调 value 契约。
+ * 模型列表卡片（表格版）：
+ * - 纯展示，**没有回调** —— 表格分页由飞书客户端完成，服务端不参与；
+ * - 单元格是 provider/id 完整格式，用户直接选中复制就能粘进 /model；
+ * - 名称列只在真有数据时出现（全空的一列比没有更难看）。
  */
-import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildModelsCard, buildModelsCardResolved, MODELS_PAGE_SIZE, modelLabel } from "../src/commands/models-card.js";
+import { test } from "node:test";
+import { MODELS_TABLE_PAGE_SIZE, THINKING_LEVELS_PER_ROW, buildModelStatusCard, buildModelsTable, modelLabel } from "../src/commands/models-card.js";
 
-const models = [
-	{ id: "deepseek-flash", provider: "deepseek" },
-	{ id: "deepseek-v4-pro", provider: "deepseek" },
-	...Array.from({ length: 20 }, (_, i) => ({ id: `gpt-x${i}`, provider: "openai" })),
-];
-const base = { models, currentId: "deepseek-flash", conversationKey: "oc_x:u:ou_y" };
+const base = {
+	models: [
+		{ id: "deepseek-flash", provider: "deepseek", name: "DeepSeek Flash" },
+		{ id: "deepseek-v4-pro", provider: "deepseek", name: "DeepSeek V4 Pro" },
+		{ id: "gpt-4", provider: "openai", name: "GPT-4" },
+	],
+	currentId: "deepseek-flash",
+};
 
-function buttons(card: unknown): Array<Record<string, unknown>> {
-	const body = (card as { body: { elements: unknown[] } }).body;
-	return body.elements.filter((el) => (el as { tag?: string }).tag === "button") as Array<Record<string, unknown>>;
+type Card = {
+	schema: string;
+	config: Record<string, unknown>;
+	header: { title: { content: string }; template: string };
+	body: { elements: Array<Record<string, unknown>> };
+};
+
+function tableOf(card: Card): Record<string, unknown> {
+	const table = card.body.elements.find((e) => e.tag === "table");
+	assert.ok(table, "卡片必须有 table 元素");
+	return table;
 }
 
-test("模型卡片：header 不带 tag（飞书 card 2.0 会拒卡），且是 2.0 schema", () => {
-	const card = buildModelsCard({ ...base, page: 0 }) as { schema: string; header: Record<string, unknown> };
+test("models 表格：header 不带 tag（飞书 card 2.0 会拒卡 200621）", () => {
+	const card = buildModelsTable(base) as Card;
 	assert.equal(card.schema, "2.0");
-	assert.ok(!("tag" in card.header), "header 不能有 tag 字段");
-	assert.equal((card.header.title as { content: string }).content, `可用模型（${models.length}）`);
+	assert.equal(card.header.title.content, "可用模型（3）");
+	assert.ok(!("tag" in card.header), "header 是对象本身，不接受 tag 字段");
 });
 
-test("模型卡片：每页数量受控，当前模型置顶且按钮禁用", () => {
-	const card = buildModelsCard({ ...base, page: 0 });
-	const btns = buttons(card);
-	// 模型按钮 = pageSize 个（不算翻页），当前模型那个 disabled
-	const modelBtns = btns.filter((b) => (b.value as { op: string }).op === "models.pick");
-	assert.equal(modelBtns.length, MODELS_PAGE_SIZE);
-	const currentBtn = modelBtns.find((b) => (b.value as { id: string }).id === "deepseek-flash");
-	assert.equal(currentBtn?.disabled, true, "当前模型按钮应禁用");
-	assert.match((currentBtn?.text as { content: string }).content, /^✓ /);
-	// 首行 markdown 显式标出当前模型
-	const first = (card as { body: { elements: Array<{ content?: string }> } }).body.elements[0];
-	assert.match(first.content ?? "", /当前：\*\*deepseek\/deepseek-flash\*\*/);
+test("models 表格：列是 provider/model 完整格式，且每行都有 model 字段", () => {
+	const card = buildModelsTable(base) as Card;
+	const table = tableOf(card);
+	const columns = table.columns as Array<{ name: string; display_name: string; data_type: string }>;
+	const rows = table.rows as Array<Record<string, string>>;
+
+	assert.equal(columns[0]?.name, "model");
+	assert.equal(columns[0]?.data_type, "text", "纯文本单元格：实测比 markdown 反引号在移动端更紧凑");
+	assert.equal(rows.length, 3);
+	// 复制就能用：必须是 provider/id，不能只有 id
+	assert.deepEqual(rows.map((r) => r.model), ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro", "openai/gpt-4"]);
 });
 
-test("模型卡片：切换按钮的 value 带 provider/id/conversationKey 三件套", () => {
-	const card = buildModelsCard({ ...base, page: 0, pageSize: 3 });
-	const pick = buttons(card).find((b) => (b.value as { id: string }).id === "deepseek-v4-pro");
-	assert.ok(pick, "应能找到 deepseek-v4-pro 的按钮");
-	assert.deepEqual(pick.value, {
-		op: "models.pick", provider: "deepseek", id: "deepseek-v4-pro", conversationKey: "oc_x:u:ou_y",
-	});
+test("models 表格：page_size 默认 10（客户端分页，不需要服务端回调）", () => {
+	const card = buildModelsTable(base) as Card;
+	assert.equal(tableOf(card).page_size, MODELS_TABLE_PAGE_SIZE);
+	assert.equal(MODELS_TABLE_PAGE_SIZE, 10);
+
+	const custom = buildModelsTable({ ...base, pageSize: 5 }) as Card;
+	assert.equal(tableOf(custom).page_size, 5);
 });
 
-test("模型卡片：分页按钮边界正确（首屏上一页禁用、末屏下一页禁用）", () => {
-	const pages = Math.ceil(models.length / MODELS_PAGE_SIZE);
-	const first = buttons(buildModelsCard({ ...base, page: 0 })).filter((b) => (b.value as { op: string }).op === "models");
-	assert.equal(first[0]?.disabled, true, "首页上一页应禁用");
-	assert.equal(first[1]?.disabled, false);
-
-	const last = buttons(buildModelsCard({ ...base, page: pages - 1 })).filter((b) => (b.value as { op: string }).op === "models");
-	assert.equal(last[0]?.disabled, false);
-	assert.equal(last[1]?.disabled, true, "末页下一页应禁用");
-	// 越界 page 会被夹到有效范围，不产生空卡片
-	const clamped = buildModelsCard({ ...base, page: 999 });
-	assert.match(((clamped as { header: { subtitle: { content: string } } }).header.subtitle).content, new RegExp(`${pages}/${pages}`));
+test("models 表格：当前模型在正文里标明（表格里没有按钮可高亮）", () => {
+	const card = buildModelsTable(base) as Card;
+	const note = card.body.elements.find((e) => e.tag === "markdown") as { content: string };
+	assert.match(note.content, /当前：\*\*deepseek\/deepseek-flash\*\*/);
+	assert.match(note.content, /\/model </, "要告诉用户怎么切换");
 });
 
-test("模型卡片：单页时不出现翻页按钮", () => {
-	const card = buildModelsCard({ models: models.slice(0, 2), currentId: "deepseek-flash", page: 0, conversationKey: "k" });
-	assert.equal(buttons(card).filter((b) => (b.value as { op: string }).op === "models").length, 0);
+test("models 表格：没有任何 name 时不出现名称列", () => {
+	const noName = { models: [{ id: "a" }, { id: "b", provider: "p" }], currentId: "a" };
+	const card = buildModelsTable(noName) as Card;
+	const columns = tableOf(card).columns as Array<{ name: string }>;
+	assert.deepEqual(columns.map((c) => c.name), ["model"], "全空的名称列没有价值");
 });
 
-test("modelLabel：带 provider 前缀，无 provider 时退化为纯 id", () => {
-	assert.equal(modelLabel({ id: "x", provider: "deepseek" }), "deepseek/x");
-	assert.equal(modelLabel({ id: "x" }), "x");
+test("models 表格：部分行有 name 时保留名称列（缺失的行不写该字段）", () => {
+	const mixed = {
+		models: [{ id: "a", provider: "p", name: "A" }, { id: "b", provider: "p" }],
+		currentId: "a",
+	};
+	const card = buildModelsTable(mixed) as Card;
+	const table = tableOf(card);
+	const columns = table.columns as Array<{ name: string }>;
+	const rows = table.rows as Array<Record<string, string>>;
+	assert.deepEqual(columns.map((c) => c.name), ["model", "name"]);
+	assert.equal(rows[0]?.name, "A");
+	assert.equal(rows[1]?.name, undefined, "缺失时不要写空字符串（表格会渲染成空行）");
 });
 
-test("已处理卡片：所有按钮禁用并给出结论", () => {
-	const card = buildModelsCardResolved({ ...base, page: 0 }, "deepseek/deepseek-v4-pro", true, "");
-	const btns = buttons(card);
-	assert.ok(btns.every((b) => b.disabled === true), "已处理卡片所有按钮必须禁用");
-	const header = (card as { header: { template: string } }).header;
-	assert.equal(header.template, "green");
+test("modelLabel：有 provider 时带前缀，没有时退化为裸 id", () => {
+	assert.equal(modelLabel({ id: "gpt-4", provider: "openai" }), "openai/gpt-4");
+	assert.equal(modelLabel({ id: "bare" }), "bare");
+});
+
+// ── /model 状态卡 ───────────────────────────────────────────────────────
+// 状态卡只回答「我现在用什么、怎么换」，不重复候选列表（那在 /models 里）。
+// 两个按钮是**动作**：点档位切换思考等级，点「查看全部模型」触发 /models。
+
+type StatusCard = { header: { title: { content: string }; template: string }; body: { elements: Array<Record<string, unknown>> } };
+
+function buttonsOf(card: StatusCard): Array<Record<string, unknown>> {
+	const found: Array<Record<string, unknown>> = [];
+	const walk = (node: unknown): void => {
+		if (Array.isArray(node)) { node.forEach(walk); return; }
+		if (node && typeof node === "object") {
+			const obj = node as Record<string, unknown>;
+			if (obj.tag === "button") found.push(obj);
+			Object.values(obj).forEach(walk);
+		}
+	};
+	card.body.elements.forEach(walk);
+	return found;
+}
+
+test("状态卡：header 无 tag，正文标明当前模型（带 provider 前缀便于复制）", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "deepseek/deepseek-v4-pro", thinkingLevel: "max",
+		availableLevels: ["high", "max"], conversationKey: "oc_x:u:ou_y",
+	}) as StatusCard;
+	assert.equal(card.header.title.content, "模型");
+	assert.ok(!("tag" in card.header));
+	const note = card.body.elements.find((e) => e.tag === "markdown") as { content: string };
+	assert.match(note.content, /\*\*deepseek\/deepseek-v4-pro\*\*/);
+});
+
+test("状态卡：档位按钮每个都可点，当前档位禁用并打勾", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "max", availableLevels: ["high", "max"], conversationKey: "k",
+	}) as StatusCard;
+	const levelBtns = buttonsOf(card).filter((b) => (b.value as { op: string }).op === "thinking.set");
+	assert.deepEqual(levelBtns.map((b) => (b.text as { content: string }).content), ["high", "✓ max"]);
+	assert.equal(levelBtns[0]?.disabled, false, "非当前档位要可点");
+	assert.equal(levelBtns[1]?.disabled, true, "当前档位禁用 —— 否则点了没变化会让人困惑");
+	// 配色表达可点性：有颜色的（primary）才可点，灰色的（default）是当前档位。
+	// 反过来会让灰色按钮看着像不可点 —— 这正是用户反馈要改掉的。
+	assert.equal(levelBtns[0]?.type, "primary", "可点的档位要有颜色");
+	assert.equal(levelBtns[1]?.type, "default", "当前档位用灰色 + 禁用 + 勾");
+	// 回调必须能定位会话：群里一个 chatId 可能对应多个按人隔离的会话
+	for (const b of levelBtns) {
+		assert.equal((b.value as { conversationKey: string }).conversationKey, "k");
+	}
+});
+
+test("状态卡：「查看全部模型」按钮触发 models.open，并带 conversationKey", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high"], conversationKey: "k",
+	}) as StatusCard;
+	const open = buttonsOf(card).find((b) => (b.value as { op: string }).op === "models.open");
+	assert.ok(open, "必须有查看全部模型的按钮");
+	assert.equal((open.value as { conversationKey: string }).conversationKey, "k");
+	assert.equal((open.text as { content: string }).content, "/models", "按钮文字直接用命令名，看到的即是要打的");
+	assert.equal(open.type, "primary", "按钮要有颜色，看着才是能点的");
+});
+
+test("状态卡：没有可用档位时不出现空按钮组", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "off", availableLevels: [], conversationKey: "k",
+	}) as StatusCard;
+	assert.equal(buttonsOf(card).filter((b) => (b.value as { op: string }).op === "thinking.set").length, 0);
+	assert.ok(buttonsOf(card).some((b) => (b.value as { op: string }).op === "models.open"), "「查看全部模型」仍在");
+});
+
+test("状态卡：完全没有思考等级时也不出档位区块", () => {
+	const card = buildModelStatusCard({ currentLabel: "m", availableLevels: [], conversationKey: "k" }) as StatusCard;
+	assert.equal(buttonsOf(card).filter((b) => (b.value as { op: string }).op === "thinking.set").length, 0);
+});
+
+// ── 档位排版：每行 3 个等宽（多看几档也不会挤） ────────────────────────
+// pi 最多 6 档，一行平分下来每个按钮只剩一两个字母宽，手机端没法点；
+// flow 自动换行又会让按钮宽度随文字长短参差。所以固定每行 3 个等宽。
+
+test("状态卡：6 档时排成 2 行、每行 3 个按钮（外加 1 个对齐占位列）", () => {
+	const levels = ["minimal", "low", "medium", "high", "max", "xhigh"];
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "medium", availableLevels: levels, conversationKey: "k",
+	}) as StatusCard;
+
+	// 含按钮的 column_set 就是档位行（标签行是 markdown，不含按钮）
+	const levelRows = card.body.elements.filter(
+		(e) => e.tag === "column_set" && JSON.stringify(e).includes("thinking.set"),
+	);
+	assert.equal(levelRows.length, 2, "6 档应排成 2 行");
+	for (const row of levelRows) {
+		const cols = row.columns as unknown[];
+		assert.equal(cols.length, 4, "每行 = 1 个对齐占位列 + 3 个按钮列");
+	}
+	// 每行恰好 3 个按钮
+	for (const row of levelRows) {
+		const n = (JSON.stringify(row).match(/thinking\.set/g) ?? []).length;
+		assert.equal(n, 3);
+	}
+});
+
+test("状态卡：2 档时仍是一行，且补足到 3 个按钮列宽（不拉伸）", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "max", availableLevels: ["high", "max"], conversationKey: "k",
+	}) as StatusCard;
+	const levelRows = card.body.elements.filter(
+		(e) => e.tag === "column_set" && JSON.stringify(e).includes("thinking.set"),
+	);
+	assert.equal(levelRows.length, 1);
+	const cols = levelRows[0]?.columns as unknown[];
+	assert.equal(cols.length, 4, "2 个按钮也要占满 3 个按钮位（补 1 个空列），否则会被拉伸");
+	assert.equal((JSON.stringify(levelRows[0]).match(/thinking\.set/g) ?? []).length, 2);
+});
+
+test("状态卡：档位按钮带勾（当前档位）且勾只在当前档位出现", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "low", availableLevels: ["low", "high", "max"], conversationKey: "k",
+	}) as StatusCard;
+	const contents = buttonsOf(card)
+		.filter((b) => (b.value as { op: string }).op === "thinking.set")
+		.map((b) => (b.text as { content: string }).content);
+	assert.deepEqual(contents, ["✓ low", "high", "max"]);
+	assert.equal(contents.filter((c) => c.startsWith("✓")).length, 1, "只能有一个勾");
+});
+
+test("状态卡：THINKING_LEVELS_PER_ROW 是 3，且列宽全部用 weighted（等宽）", () => {
+	assert.equal(THINKING_LEVELS_PER_ROW, 3);
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "max",
+		availableLevels: ["minimal", "low", "medium", "high", "max", "xhigh"], conversationKey: "k",
+	}) as StatusCard;
+	for (const row of card.body.elements.filter((e) => e.tag === "column_set")) {
+		for (const col of (row.columns as Array<Record<string, unknown>>)) {
+			if (JSON.stringify(col).includes("thinking.set")) {
+				assert.equal(col.width, "weighted", "等宽不能靠 auto（宽度随文字长短变化）");
+			}
+		}
+	}
 });
