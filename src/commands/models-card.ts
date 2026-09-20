@@ -25,8 +25,6 @@ export interface ModelsTableInput {
 	currentId: string;
 	/** 每页行数。table 组件的 page_size，客户端翻页用。 */
 	pageSize?: number;
-	/** 刚刚执行的命令（从状态卡点「/models」按钮进来时是 `/models`）。 */
-	lastExecuted?: string;
 }
 
 export const MODELS_TABLE_PAGE_SIZE = 10;
@@ -44,6 +42,10 @@ export function modelLabel(entry: ModelEntry): string {
  *
  * 单独成块而不是混在正文里：它是"回执"，与设置项、说明文字是不同性质的信息，
  * 贴在一起容易被当成正文的一部分读过去。
+ *
+ * 只用在**状态卡**上：那张卡的按钮会让卡片内容发生变化（档位/模型的勾要移动），
+ * 所以需要一条回执说明"刚才跑的是什么命令"。表格卡片是纯展示的列表，
+ * 从它那里点进来的场景不需要回执（用户自己知道点了什么）。
  */
 function executedBlock(command?: string): unknown[] {
 	if (!command) return [];
@@ -84,7 +86,6 @@ export function buildModelsTable(input: ModelsTableInput): unknown {
 					content: `当前：**${current ? modelLabel(current) : input.currentId}**\n`
 						+ "切换用 `/model <provider>/<模型>`。表格可翻页，单元格可直接选中复制。",
 				},
-				...executedBlock(input.lastExecuted),
 				{
 					tag: "table",
 					page_size: pageSize,

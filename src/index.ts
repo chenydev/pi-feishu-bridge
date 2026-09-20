@@ -206,8 +206,7 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 			log.info("feishu.card.models_open", { conversationKey: value.conversationKey });
 			if (!action.chatId) return { toast: { type: "warning", content: "无法确定目标会话" } };
 			try {
-				// 带上这次执行的命令：用户点的是按钮，等价于发了 /models
-				await transport?.sendCard(action.chatId, buildModelsTable({ ...data, lastExecuted: "/models" }));
+				await transport?.sendCard(action.chatId, buildModelsTable(data));
 				return { toast: { type: "success", content: "已发送模型列表" } };
 			} catch (error) {
 				return { toast: { type: "warning", content: `发送失败：${error instanceof Error ? error.message.slice(0, 60) : "未知错误"}` } };

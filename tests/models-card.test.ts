@@ -303,16 +303,10 @@ test("已执行：是独立一块（上下都有分割线）", () => {
 	assert.equal(els[idx + 1]?.tag, "hr", "下面也要有分割线，这样才是独立一块");
 });
 
-test("表格卡片：支持已执行（从状态卡点「/models」按钮进来）", () => {
-	const card = buildModelsTable({
-		models: [{ id: "a", provider: "p" }], currentId: "a", lastExecuted: "/models",
-	}) as unknown as { body: { elements: Array<Record<string, unknown>> } };
-	const all = JSON.stringify(card);
-	assert.match(all, /已执行/);
-	assert.match(all, /`\/models`/);
-	const idx = card.body.elements.findIndex((e) => JSON.stringify(e).includes("已执行"));
-	assert.equal(card.body.elements[idx - 1]?.tag, "hr");
-	assert.equal(card.body.elements[idx + 1]?.tag, "hr");
+test("表格卡片：不出现已执行块（回执只属于会发生变化的卡片）", () => {
+	// 表格是纯展示列表：用户点「/models」自己知道点了什么，混一条回执只是噪音
+	const card = buildModelsTable({ models: [{ id: "a", provider: "p" }], currentId: "a" });
+	assert.doesNotMatch(JSON.stringify(card), /已执行/);
 });
 
 test("表格卡片：没有已执行时不出现该块（首屏干净）", () => {
