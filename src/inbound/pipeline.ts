@@ -28,6 +28,8 @@ export interface IntakeLedger {
 	has(id: string): boolean;
 	/** batch 合并：成员记录并入主记录。 */
 	merge(primaryId: string, memberIds: string[], merged: FeishuInboundMessage): void;
+	/** 标记为永不重放（命令类消息；可选实现）。 */
+	markNever?(id: string): void;
 }
 
 export interface PipelineDeps {
@@ -116,6 +118,11 @@ export class InboundPipeline {
 		}
 		if (this.deps.onCommand) {
 			if (this.batcher.peek(key)) await this.flushBatch(key);
+			// 命令类消息（/new、/stop…）在账本里标为 never：重启后不重放。
+			// 依赖方不再重放一个 /new（会再清一次上下文）或 /stop（会打断新任务）。
+			// 在调用 onCommand 之前标记 —— 标记本身针对跨进程重放，与本进程内的
+			// 重试（dedup.forget 后重投）互不冲突。
+			if (prepared.text.trimStart().startsWith("/")) this.deps.intake?.markNever?.(prepared.messageId);
 			try {
 				if (await this.deps.onCommand(prepared)) return;
 			} catch (error) {
@@ -205,7 +212,17 @@ export class InboundPipeline {
 		const verdict = admit(this.deps.config, msg, mentioned, replyToBot, this.deps.lastSent);
 		if (!verdict.ok) {
 			this.stats.dropped += 1;
-			this.deps.log?.("debug", "feishu.pipeline.drop", { messageId: msg.messageId, reason: verdict.reason });
+			// 日志带 hint：admit 已经针对每种拒绝给出「照做就能通过」的具体动作
+			// （加哪个文件的哪个字段、加什么值）。准入是 fail-closed 的，被挡很常见，
+			// 而「为什么被挡、怎么放行」不该靠人翻代码或写文档才能回答。
+			this.deps.log?.("debug", "feishu.pipeline.drop", {
+				messageId: msg.messageId,
+				chatId: msg.chatId,
+				chatType: msg.chatType,
+				reason: verdict.reason,
+				...(msg.isBot ? { senderId: msg.senderId, senderAppId: msg.senderAppId ?? null } : {}),
+				...(verdict.hint ? { hint: verdict.hint } : {}),
+			});
 			return undefined;
 		}
 

@@ -10,7 +10,7 @@ import { DEFAULT_CONFIG, type BridgeConfig, type FeishuInboundMessage } from "..
 import type { FeishuTransport } from "../src/inbound/transport.js";
 
 function cfg(over: Partial<BridgeConfig> = {}): BridgeConfig {
-	return { ...DEFAULT_CONFIG, ...over };
+	return { ...DEFAULT_CONFIG, allowChats: ["oc_group", "oc_chat", "oc_x", "oc_real_chat", "oc_a", "oc_b", "oc_g", "oc_y", "oc_other", "oc_ok", "bad", "good"], ...over };
 }
 
 const BATCH = { enabled: true, textWindowMs: 30, maxMessages: 8, maxChars: 4_000 };
@@ -120,7 +120,7 @@ test("全链路：未 @ 群消息丢弃（mention 策略）", async () => {
 test("全链路：重复 message_id 只 dispatch 一次", async () => {
 	const dispatched: FeishuInboundMessage[] = [];
 	const pipeline = new InboundPipeline({
-		config: cfg({ groupPolicy: "open", batch: NO_BATCH }),
+		config: cfg({ groupPolicy: "open", batch: NO_BATCH, implicitAdmins: ["ou_user"] }),
 		transport: {} as FeishuTransport,
 		lastSent: new LastSentCache(8),
 		onDispatch: async (m) => { dispatched.push(m); },
@@ -280,7 +280,7 @@ test("入站命令：显式消费且不进入 batch/Agent，未知斜杠命令�
 	const commands: string[] = [];
 	const dispatched: string[] = [];
 	const pipeline = new InboundPipeline({
-		config: cfg({ groupPolicy: "open", batch: NO_BATCH }), transport: {} as FeishuTransport,
+		config: cfg({ groupPolicy: "open", batch: NO_BATCH, implicitAdmins: ["ou_user"] }), transport: {} as FeishuTransport,
 		lastSent: new LastSentCache(8),
 		onCommand: async (msg) => { commands.push(msg.text); return msg.text === "/feishu status"; },
 		onDispatch: async (msg) => { dispatched.push(msg.text); },
