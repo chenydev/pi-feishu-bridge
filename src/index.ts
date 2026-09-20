@@ -206,7 +206,14 @@ export default function feishuBridgeExtension(pi: ExtensionAPI) {
 				return { toast: { type: "warning", content: "会话已失效，请重新发送 /model" } };
 			}
 			log.info("feishu.card.models_toggle", { expanded, conversationKey: value.conversationKey });
-			return { card: { type: "raw", data: buildModelStatusCard({ ...data, expanded }) } };
+			// 展开时给回执（等价命令就是 /models）；收起不给 —— 「收起」没有对应的
+			// 斜杠命令，硬编一句"已执行：收起"只是假回执。
+			return {
+				card: {
+					type: "raw",
+					data: buildModelStatusCard({ ...data, expanded, ...(expanded ? { lastExecuted: "/models" } : {}) }),
+				},
+			};
 		}
 		// P2-01：澄清选择 —— 只恢复等待点，不写任何授权
 		if (value.op === "clarify") {

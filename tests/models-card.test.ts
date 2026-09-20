@@ -243,7 +243,7 @@ test("状态卡：首屏不罗列全部命令（那是「已执行」的职责�
 	assert.doesNotMatch(JSON.stringify(card), /`\/thinking high`/, "没点过任何按钮就不该有已执行回执");
 });
 
-test("状态卡：「已执行」区块显示刚跑的命令，位置在底部小字上面", () => {
+test("状态卡：「已执行」放在卡片**顶部**（最新信息最先看到）", () => {
 	const card = buildModelStatusCard({
 		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high", "max"],
 		conversationKey: "k", lastExecuted: "/thinking high",
@@ -252,10 +252,10 @@ test("状态卡：「已执行」区块显示刚跑的命令，位置在底部�
 	assert.match(all, /已执行/, "要有已执行回执");
 	assert.match(all, /`\/thinking high`/, "命令要被反引号包起来，方便选中复制");
 
-	// 顺序：已执行 必须出现在 -g 提示之前（用户要求"在小字上面"）
+	// 顺序：已执行 必须在当前模型名之前 —— 它在卡片最上面
 	const idxExec = all.indexOf("已执行");
-	const idxTip = all.indexOf("-g");
-	assert.ok(idxExec > 0 && idxTip > 0 && idxExec < idxTip, `已执行(${idxExec}) 应在 -g 提示(${idxTip}) 之前`);
+	const idxModel = all.indexOf("**m**");
+	assert.ok(idxExec >= 0 && idxModel >= 0 && idxExec < idxModel, `已执行(${idxExec}) 应在模型名(${idxModel}) 之前`);
 });
 
 test("状态卡：没有 lastExecuted 时不出现已执行区块", () => {
@@ -300,7 +300,7 @@ test("已执行：是独立一块（上下都有分割线）", () => {
 	}) as StatusCard;
 	const els = card.body.elements;
 	const idx = els.findIndex((e) => JSON.stringify(e).includes("已执行"));
-	assert.ok(idx > 0);
+	assert.ok(idx > 0, "已执行块应在卡片内");
 	assert.equal(els[idx - 1]?.tag, "hr", "上面要有分割线");
 	assert.equal(els[idx + 1]?.tag, "hr", "下面也要有分割线，这样才是独立一块");
 });
@@ -341,4 +341,19 @@ test("状态卡：收起态不含表格（省一次 listModels，卡片也不该
 		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high"], conversationKey: "k",
 	}) as StatusCard;
 	assert.equal(card.body.elements.find((e) => e.tag === "table"), undefined);
+});
+
+// ── 收回执：点 /models 展开也要给（用户要求）────────────────────────────
+
+test("状态卡：展开表格时同样显示已执行回执（等价命令 /models）", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high"],
+		conversationKey: "k", expanded: true, models: [{ id: "a", provider: "p" }],
+		lastExecuted: "/models",
+	}) as StatusCard;
+	const all = JSON.stringify(card);
+	assert.match(all, /已执行/, "展开动作也要有回执");
+	assert.match(all, /`\/models`/);
+	// 回执仍在最上面：展开只是往卡片末尾追加表格，不该把回执挤走
+	assert.ok(all.indexOf("已执行") < all.indexOf("\"tag\":\"table\""), "回执应在表格之前");
 });

@@ -173,6 +173,9 @@ function kvRow(label: string, value: string, bold = false): unknown {
  */
 export function buildModelStatusCard(input: ModelStatusInput): unknown {
 	const elements: unknown[] = [
+		// 「已执行」放**最上面**：它属于「刚刚发生了什么」，最新信息该在最先看到的位置
+		// （像聊天记录倒序）。夹在按钮与说明之间时容易被当成正文读过去。
+		...executedBlock(input.lastExecuted),
 		{ tag: "markdown", content: `**${input.currentLabel}**` },
 		{ tag: "hr" },
 	];
@@ -265,8 +268,6 @@ export function buildModelStatusCard(input: ModelStatusInput): unknown {
 		],
 	});
 	elements.push(kvRow("切换模型", "`/model <provider>/<模型>`"));
-	// 「已执行」独立成块，放在底部小字**上面** —— 紧挨着说这次点的是什么命令。
-	elements.push(...executedBlock(input.lastExecuted));
 	// 底部小字：把「怎么把改动变成全局默认」写在入口旁边 —— 否则这个能力
 	// 只有读过文档的人知道，而卡片是绝大多数人唯一的入口。
 	elements.push({
