@@ -287,3 +287,35 @@ test("状态卡：底部 -g 提示用小字号，不与正文抢注意力", () =
 	) as { text_size?: string } | undefined;
 	assert.equal(tip?.text_size, "notation", "提示内容字号要和正文区分开");
 });
+
+
+// ── 「已执行」独立成块 + 表格卡片也支持 ────────────────────────────────
+
+test("已执行：是独立一块（上下都有分割线）", () => {
+	const card = buildModelStatusCard({
+		currentLabel: "m", thinkingLevel: "high", availableLevels: ["high"],
+		conversationKey: "k", lastExecuted: "/thinking high",
+	}) as StatusCard;
+	const els = card.body.elements;
+	const idx = els.findIndex((e) => JSON.stringify(e).includes("已执行"));
+	assert.ok(idx > 0);
+	assert.equal(els[idx - 1]?.tag, "hr", "上面要有分割线");
+	assert.equal(els[idx + 1]?.tag, "hr", "下面也要有分割线，这样才是独立一块");
+});
+
+test("表格卡片：支持已执行（从状态卡点「/models」按钮进来）", () => {
+	const card = buildModelsTable({
+		models: [{ id: "a", provider: "p" }], currentId: "a", lastExecuted: "/models",
+	}) as unknown as { body: { elements: Array<Record<string, unknown>> } };
+	const all = JSON.stringify(card);
+	assert.match(all, /已执行/);
+	assert.match(all, /`\/models`/);
+	const idx = card.body.elements.findIndex((e) => JSON.stringify(e).includes("已执行"));
+	assert.equal(card.body.elements[idx - 1]?.tag, "hr");
+	assert.equal(card.body.elements[idx + 1]?.tag, "hr");
+});
+
+test("表格卡片：没有已执行时不出现该块（首屏干净）", () => {
+	const card = buildModelsTable({ models: [{ id: "a", provider: "p" }], currentId: "a" });
+	assert.doesNotMatch(JSON.stringify(card), /已执行/);
+});

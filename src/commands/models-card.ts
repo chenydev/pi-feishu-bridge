@@ -25,6 +25,8 @@ export interface ModelsTableInput {
 	currentId: string;
 	/** 每页行数。table 组件的 page_size，客户端翻页用。 */
 	pageSize?: number;
+	/** 刚刚执行的命令（从状态卡点「/models」按钮进来时是 `/models`）。 */
+	lastExecuted?: string;
 }
 
 export const MODELS_TABLE_PAGE_SIZE = 10;
@@ -35,6 +37,21 @@ export const THINKING_LEVELS_PER_ROW = 3;
 /** provider/id 形式（同一 id 可能来自不同 provider，必须带前缀才能无歧义）。 */
 export function modelLabel(entry: ModelEntry): string {
 	return entry.provider ? `${entry.provider}/${entry.id}` : entry.id;
+}
+
+/**
+ * 「已执行」区块 —— **独立一块**（上下各一条分割线 + 引用块）。
+ *
+ * 单独成块而不是混在正文里：它是"回执"，与设置项、说明文字是不同性质的信息，
+ * 贴在一起容易被当成正文的一部分读过去。
+ */
+function executedBlock(command?: string): unknown[] {
+	if (!command) return [];
+	return [
+		{ tag: "hr" },
+		{ tag: "markdown", content: `> **已执行**：\`${command}\`` },
+		{ tag: "hr" },
+	];
 }
 
 export function buildModelsTable(input: ModelsTableInput): unknown {
@@ -67,6 +84,7 @@ export function buildModelsTable(input: ModelsTableInput): unknown {
 					content: `当前：**${current ? modelLabel(current) : input.currentId}**\n`
 						+ "切换用 `/model <provider>/<模型>`。表格可翻页，单元格可直接选中复制。",
 				},
+				...executedBlock(input.lastExecuted),
 				{
 					tag: "table",
 					page_size: pageSize,
@@ -225,12 +243,8 @@ export function buildModelStatusCard(input: ModelStatusInput): unknown {
 		],
 	});
 	elements.push(kvRow("切换模型", "`/model <provider>/<模型>`"));
-	// 「已执行」区块：放在底部小字**上面**，紧接着说这次点的是什么命令。
-	// 用引用块（blockquote）区分于正文，一眼能看出是"回执"而不是"设置项"。
-	if (input.lastExecuted) {
-		elements.push({ tag: "markdown", content: `> **已执行**：\`${input.lastExecuted}\`` });
-	}
-	elements.push({ tag: "hr" });
+	// 「已执行」独立成块，放在底部小字**上面** —— 紧挨着说这次点的是什么命令。
+	elements.push(...executedBlock(input.lastExecuted));
 	// 底部小字：把「怎么把改动变成全局默认」写在入口旁边 —— 否则这个能力
 	// 只有读过文档的人知道，而卡片是绝大多数人唯一的入口。
 	elements.push({
