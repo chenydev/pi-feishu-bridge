@@ -72,9 +72,6 @@ pi install git:github.com/chenydev/pi-feishu-bridge
 # 生产建议钉到具体 commit（仓库当前不打 tag；若以后有 tag，可直接写 @v0.1.0）
 pi install git:github.com/chenydev/pi-feishu-bridge@<commit-sha>
 
-# 用 SSH（走本机 ~/.ssh/config 里的密钥）
-pi install git:git@github.com:chenydev/pi-feishu-bridge
-
 # 装到项目级设置（.pi/settings.json，可随仓库共享）
 pi install -l git:github.com/chenydev/pi-feishu-bridge
 ```
