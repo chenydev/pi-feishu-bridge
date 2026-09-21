@@ -39,6 +39,27 @@ test("L2：读技能 → 「读取技能：<name>」，读普通文件 → 动�
 	assert.equal(renderToolLine("read", { path: "/workspace/src/index.ts" }), "📖 读取 /workspace/src/index.ts");
 });
 
+test("L3：续气泡标题为「执行过程（续）」，且只渲染传进来的行窗口", () => {
+	// 换气泡时调用方传的是**本条气泡自己的窗口**（不是全量日志），因此续气泡天然不重复旧内容。
+	const text = renderProgressText(
+		[{ text: "💻 运行 echo 18", count: 1 }],
+		undefined,
+		view,
+		{ startedAt: 1_000, now: 2_000, continued: true },
+	);
+	assert.ok(text.startsWith("🤖 执行过程（续）"), text);
+	assert.ok(text.includes("💻 运行 echo 18"), text);
+	assert.ok(!text.includes("echo 0"), text);
+
+	// 首个气泡不带「（续）」；收尾后即便还没有行，续气泡也由页脚交代结果
+	assert.ok(renderProgressText([{ text: "💻 运行 a", count: 1 }], undefined, view, { now: 2_000 })
+		.startsWith("🤖 执行过程\n"), "首个气泡标题不带（续）");
+	assert.equal(
+		renderProgressText([], undefined, view, { startedAt: 1_000, finishedAt: 2_000, outcome: "ok", now: 2_000, continued: true }),
+		"🤖 执行过程（续）\n✅ 完成 · 1.0s",
+	);
+});
+
 // ------------------------------------------------------------ 文案 ----
 
 test("L2：bash 单行（不用代码块）、脱敏、动词短语", () => {

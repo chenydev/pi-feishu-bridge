@@ -506,6 +506,16 @@ test("编辑配额用尽后自动轮换成新进度消息（不再无限编辑�
 		assert.ok(sent.length >= 1, "轮换应新发一条进度消息");
 		assert.ok(targets[0] === "om_progress", "先编辑原消息");
 		assert.ok(!targets.includes(undefined as unknown as string), "不得写入空 messageId");
+
+		// 续写语义：新气泡只写「旧气泡从未展示过的行」，不把旧气泡的尾部再贴一遍。
+		// 配额 18：om_progress 展示到 echo 17（下标 17），echo 18 正好是没挤进去的那一行。
+		assert.ok(sent[0].includes("🤖 执行过程（续）"), `新气泡应标「续」：${sent[0]}`);
+		assert.ok(sent[0].includes("💻 运行 echo 18"), `新气泡应接上前一条没展示的那行：${sent[0]}`);
+		assert.ok(!sent[0].includes("💻 运行 echo 0\n"), `新气泡不得重复旧气泡的内容：${sent[0]}`);
+		assert.ok(!sent[0].includes("echo 17"), `旧气泡已展示的行不得再出现一次：${sent[0]}`);
+		const oldEdits = edits.filter(([id]) => id === "om_progress").map(([, text]) => text);
+		assert.ok(oldEdits.length > 0 && !oldEdits.some((text) => text.includes("echo 18")),
+			`旧气泡不该拿到超出配额的那行：${JSON.stringify(oldEdits.slice(-2))}`);
 	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -520,5 +530,8 @@ test("编辑配额耗尽时终态页脚也不丢（轮换成新消息写结论�
 		const terminalInSend = sent.some((text) => text.includes("✅ 完成"));
 		assert.ok(terminalInEdit || terminalInSend, `终态页脚必须落地：edits=${JSON.stringify(edited)} sends=${JSON.stringify(sent)}`);
 		assert.equal(recalled.length, 0, "keepOnFinish 默认保留");
+		// 结论落在「续」气泡（旧气泡配额已满），且不重复旧气泡的内容
+		const terminalText = [...edited.map(([, t]) => t), ...sent].find((t) => t.includes("✅ 完成"))!;
+		assert.ok(terminalText.includes("🤖 执行过程（续）"), `结论应写在续气泡里：${terminalText}`);
 	} finally { rmSync(dir, { recursive: true, force: true }); }
 });

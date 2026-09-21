@@ -210,6 +210,14 @@ export interface ProgressSnapshot {
 	finishedAt?: number;
 	outcome?: "ok" | "failed" | "stopped";
 	now: number;
+	/**
+	 * 这是**续气泡**：本条消息不再是本轮的第一个进度气泡（发生换气泡后为 true）。
+	 *
+	 * 换气泡时新消息只写「旧气泡从未展示过的行」，标题标成「执行过程（续）」——
+	 * 一轮长任务因此读成一段连续日志（旧气泡留它自己的窗口、新气泡接着往后写），
+	 * 而不是把旧气泡的尾部原样再贴一遍。
+	 */
+	continued?: boolean;
 }
 
 /** 把毫秒渲染成紧凑时长（`12.4s` / `2m30s`）。 */
@@ -232,6 +240,9 @@ export function formatDuration(ms: number): string {
  * ```
  * 尚无工具行时标题为「正在处理…」（首次渲染不突兀）；收尾后标题固定为「执行过程」并由
  * 页脚（✅/⚠️）交代结果，避免出现「正在处理… + 已完成」这种自相矛盾的一屏。
+ *
+ * 传入的 `lines` 是**本条气泡自己的窗口**（调用方按气泡切片），不是全量日志：
+ * 换气泡时新气泡只拿它该展示的那部分，因此不会重复旧气泡的内容。
  */
 export function renderProgressText(
 	lines: ProgressLine[],
@@ -240,7 +251,8 @@ export function renderProgressText(
 	snapshot: ProgressSnapshot,
 ): string {
 	const finished = snapshot.finishedAt !== undefined;
-	const header = finished || lines.length > 0 ? "🤖 执行过程" : "🤖 正在处理…";
+	const title = snapshot.continued ? "🤖 执行过程（续）" : "🤖 执行过程";
+	const header = finished || lines.length > 0 ? title : "🤖 正在处理…";
 	const output: string[] = [header];
 
 	const maxLines = Math.max(1, view.maxLines);

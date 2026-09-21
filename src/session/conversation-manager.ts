@@ -67,6 +67,18 @@ interface ProgressState {
 	lastUpdateAt: number;
 	/** 追加式日志行（见 `progress-render.ts` 的设计说明）。 */
 	lines: ProgressLine[];
+	/**
+	 * 当前气泡第一行的下标。
+	 *
+	 * 飞书同一条消息最多编辑 20 次，长任务必然撞上限，因此需要换气泡（新发一条继续）。
+	 * 换气泡时把它移到「旧气泡从未展示过的第一行」：新气泡只写之后的内容，不重复旧气泡，
+	 * 一轮任务在群里读成一段连续日志（对齐 hermes `_roll_progress_overflow_if_needed` 的切分语义）。
+	 */
+	pageStart: number;
+	/** 当前气泡上一次写出去时 `lines` 的长度（= 旧气泡已经展示到哪一行）。 */
+	shownUpTo: number;
+	/** 第几个进度气泡（0 = 首个）。换过气泡后标题标「（续）」，避免看成新的一轮。 */
+	pageIndex: number;
 	/** `new` 档去重：上一个已追加的工具名（hermes `last_tool`）。 */
 	lastToolName?: string;
 	/** 已见过的 toolCallId（SDK 重放/重试去重）。 */
@@ -354,7 +366,7 @@ export class ConversationManager {
 	private progressState(key: string): ProgressState {
 		let state = this.progressBySession.get(key);
 		if (!state) {
-			state = { lastUpdateAt: 0, edits: 0, lines: [], seenCallIds: new Set() };
+			state = { lastUpdateAt: 0, edits: 0, lines: [], seenCallIds: new Set(), pageStart: 0, shownUpTo: 0, pageIndex: 0 };
 			this.progressBySession.set(key, state);
 		}
 		return state;
@@ -436,10 +448,28 @@ export class ConversationManager {
 		const now = Date.now();
 		if (now - st.lastUpdateAt < this.progressMinIntervalMs) return; // 节流
 		st.lastUpdateAt = now;
-		const text = renderProgressText(st.lines, this.progressThinking(st), {
+		await this.writeProgressText(sess, st, false);
+	}
+
+	/**
+	 * 渲染**当前气泡**的正文。
+	 *
+	 * 只取 `st.lines.slice(st.pageStart)` —— 即本气泡自己的窗口；换过气泡之后标题变
+	 * 「执行过程（续）」，因此新气泡不会把旧气泡的尾部再贴一遍。
+	 */
+	private currentProgressText(
+		st: ProgressState,
+		opts: { outcome?: "ok" | "failed" | "stopped" } = {},
+	): string {
+		return renderProgressText(st.lines.slice(st.pageStart), this.progressThinking(st), {
 			mode: this.progressMode, maxLines: this.progressMaxLines, previewChars: this.progressPreviewChars,
-		}, { startedAt: st.startedAt, now });
-		await this.writeProgressText(sess, st, text);
+		}, {
+			startedAt: st.startedAt,
+			finishedAt: st.finishedAt,
+			outcome: opts.outcome,
+			now: st.finishedAt ?? Date.now(),
+			continued: st.pageIndex > 0,
+		});
 	}
 
 	/**
@@ -450,23 +480,33 @@ export class ConversationManager {
 	 * 长时间静默任务复现：第 20 次编辑后全部被拒，群里表现为耗时页脚冻结在 `⏱ 2m33s`，
 	 * 紧随其后的终态页脚（`✅/⏹/⚠️`）**永远发不出去**（用户以为任务卡死）。
 	 *
-	 * 因此：非终态写入只用 `PROGRESS_EDIT_BUDGET`（留 2 次给终态）；用尽即轮换新消息
-	 * （思路同 hermes 的 `_roll_progress_overflow_if_needed`，只是触发条件是**次数**而非长度）。
+	 * 因此：非终态写入只用 `PROGRESS_EDIT_BUDGET`（留 2 次给终态）；用尽即**换气泡续写**
+	 * （思路同 hermes 的 `_roll_progress_overflow_if_needed`，但触发条件是**次数**而非长度）：
+	 * 新气泡从「旧气泡从未展示过的第一行」开始（`pageStart = shownUpTo`），因此
+	 * 旧气泡保留自己的窗口、新气泡接着往后写 —— 不重复、历史不断。
 	 * 终态写入额外拿到剩余配额，配额也已耗尽时直接新发一条 —— 结果页脚绝不丢。
 	 */
-	private async writeProgressText(sess: BridgeSession, st: ProgressState, text: string, terminal = false): Promise<void> {
+	private async writeProgressText(
+		sess: BridgeSession,
+		st: ProgressState,
+		terminal = false,
+		opts: { outcome?: "ok" | "failed" | "stopped" } = {},
+	): Promise<void> {
 		if (!st.messageId) return;
 		const budget = terminal ? FEISHU_MAX_MESSAGE_EDITS : PROGRESS_EDIT_BUDGET;
 		if (st.edits < budget) {
 			st.edits += 1;
+			st.shownUpTo = st.lines.length;
 			// P0-04：进度写入与流式写入共用串行语义（同一目标永不并发，顺序确定）。
-			this.progressWriter?.enqueue(st.messageId, text);
+			this.progressWriter?.enqueue(st.messageId, this.currentProgressText(st, opts));
 			return;
 		}
-		await this.rollProgressMessage(sess, st, text);
+		st.pageStart = Math.max(st.pageStart, st.shownUpTo);
+		st.pageIndex += 1;
+		await this.rollProgressMessage(sess, st, this.currentProgressText(st, opts));
 	}
 
-	/** 编辑配额用尽：新发一条进度消息继续（旧消息保留它的最后状态）。 */
+	/** 编辑配额用尽：换气泡续写（旧气泡保留它自己的窗口，新气泡只写之后的行）。 */
 	private async rollProgressMessage(sess: BridgeSession, st: ProgressState, text: string): Promise<void> {
 		if (!st.replyTo) {
 			this.deps.log?.("warn", "feishu.progress.roll_skipped", { chatId: sess.chatId, reason: "no_reply_target" });
@@ -480,6 +520,7 @@ export class ConversationManager {
 			}
 			st.messageId = sent.messageId;
 			st.edits = 0;
+			st.shownUpTo = st.lines.length;
 			// 非卡片模式下这条消息同时是流式草稿的载体：把草稿也改指到新消息上。
 			// 只有「还没吐正文」时才会走到轮换（有正文时 renderProgress 已提前 return），
 			// 且终态阶段（finishedAt 已置）不再重绑定。
@@ -2003,9 +2044,7 @@ export class ConversationManager {
 			if (this.progressKeepOnFinish && st.lines.length > 0) {
 				// terminal=true：终态页脚拿到剩余编辑配额，配额也耗尽时 `writeProgressText`
 				// 会新发一条把结果写进去 —— 长任务的「✅/⏹/⚠️ 结论」绝不允许被编辑上限吞掉。
-				await this.writeProgressText(sess, st, renderProgressText(st.lines, this.progressThinking(st), {
-					mode: this.progressMode, maxLines: this.progressMaxLines, previewChars: this.progressPreviewChars,
-				}, { startedAt: st.startedAt, finishedAt: st.finishedAt, outcome, now: st.finishedAt }), true);
+				await this.writeProgressText(sess, st, true, { outcome });
 				if (st.messageId) await this.progressWriter?.drain(st.messageId);
 				return;
 			}
