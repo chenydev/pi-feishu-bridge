@@ -63,23 +63,65 @@
 
 ## 快速开始
 
+### 1) 用 pi 从 git 安装（推荐）
+
 ```bash
-npm install
+# 装到用户级设置（~/.pi/agent/settings.json）
+pi install git:github.com/chenydev/pi-feishu-bridge
 
-# 1) 准备配置
-cp config.example.json ~/feishu-bridge/config.json
-chmod 600 ~/feishu-bridge/config.json
+# 生产建议钉到具体 commit（仓库当前不打 tag；若以后有 tag，可直接写 @v0.1.0）
+pi install git:github.com/chenydev/pi-feishu-bridge@<commit-sha>
+
+# 用 SSH（走本机 ~/.ssh/config 里的密钥）
+pi install git:git@github.com:chenydev/pi-feishu-bridge
+
+# 装到项目级设置（.pi/settings.json，可随仓库共享）
+pi install -l git:github.com/chenydev/pi-feishu-bridge
+```
+
+- pi 会把仓库 clone 到 `~/.pi/agent/git/github.com/chenydev/pi-feishu-bridge`（项目级为
+  `.pi/git/...`），并自动在 clone 里执行 `npm install`。
+  - `@larksuiteoapi/node-sdk`（飞书 SDK）是运行依赖；
+  - `@earendil-works/pi-coding-agent` 声明为 peer，但 **npm 7+ 会自动把 peer 一起装进 clone**
+    （实测 `pi install` 后 clone 的 `node_modules` 里有它）—— 桥在建子会话时会动态
+    `import` 它（`src/session/pi-session-backend.ts`），所以这份拷贝不是多余的。
+- 仓库里的 `package.json` 声明了 `pi.extensions: ["./src/index.ts"]`，安装后 pi 启动时
+  自动加载桥的扩展（WS 长连接 daemon、`/feishu` 命令、审批卡、工具进度都在这条扩展里）。
+- 只想跑一次、不写设置：`pi -e git:github.com/chenydev/pi-feishu-bridge`。
+- 看装了什么：`pi list`；卸载：`pi remove git:github.com/chenydev/pi-feishu-bridge`。
+
+### 2) 更新
+
+git 源是**按 ref 钉住**的：`pi update --extensions` / `pi update --all` 不会把它挪到更新的
+ref，只会把已有的 clone 对齐到设置里写的 ref。要升级就显式指到新 ref：
+
+```bash
+pi install git:github.com/chenydev/pi-feishu-bridge@<new-tag-or-commit>
+```
+
+### 3) 准备配置
+
+```bash
+mkdir -p ~/.pi/agent/feishu-bridge
+cp <clone-or-repo>/config.example.json ~/.pi/agent/feishu-bridge/config.json
+chmod 600 ~/.pi/agent/feishu-bridge/config.json
 # 填入 appId / appSecret，并把 allowChats 限定为测试群
+```
 
-# 2) 注册到 pi
-pi install /path/to/pi-feishu-bridge
+配置目录默认取 pi 的 agent 目录（`pi.getAgentDir()`，通常 `~/.pi/agent`）；
+可用 `FEISHU_BRIDGE_HOME` 改写（容器里就是显式设成 pi 的配置目录）。
 
-# 3) 启动
+### 4) 启动
+
+```bash
 pi --mode rpc --provider <provider> --model <model>
 ```
 
+桥随 pi 进程启动；装了 `pi-permission-system` 时还需配 `ask` 规则才会弹飞书审批卡
+（见下面「让 pi-permission-system 的 `ask` 走飞书审批卡」）。
+
 依赖：`@larksuiteoapi/node-sdk`
-peer：`@earendil-works/pi-coding-agent`（运行时由 pi 提供）
+peer：`@earendil-works/pi-coding-agent`（`pi install` 的 `npm install` 会一并装进 clone；桥用它创建子会话）
 
 ### 飞书应用所需权限
 
@@ -96,7 +138,8 @@ peer：`@earendil-works/pi-coding-agent`（运行时由 pi 提供）
 
 ## 配置
 
-env 优先，`config.json` 持久化（路径 `$FEISHU_BRIDGE_HOME/feishu-bridge/config.json`，默认取 `$HOME`）。
+env 优先，`config.json` 持久化（路径 `$FEISHU_BRIDGE_HOME/feishu-bridge/config.json`；
+`FEISHU_BRIDGE_HOME` 未设时取 pi 的 agent 目录，即默认 `~/.pi/agent/feishu-bridge/config.json`）。
 
 完整模板见 `config.example.json`。常用项：
 
