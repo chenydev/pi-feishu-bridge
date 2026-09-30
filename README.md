@@ -1,5 +1,10 @@
 # pi-feishu-bridge
 
+> [!IMPORTANT]
+> **本仓库已停止维护，项目更名为 [pi-feishu-channel](https://github.com/chenydev/pi-feishu-channel)。**
+> 新安装请使用 `pi install git:github.com/chenydev/pi-feishu-channel`。从本仓库升级时，运行时目录 `feishu-bridge/`
+> 会在首次启动时自动迁移为 `feishu-channel/`，旧环境变量 `FEISHU_BRIDGE_*` 仍然识别；详见新仓库的 README 与 CHANGELOG。
+
 **飞书 / Lark ↔ Pi Agent 桥。** 把 [Pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) 编码助手接进飞书群聊与私聊，带消息可靠性保证、交互式审批、会话管理与可观测性。
 
 > 定位：**面向生产使用的桥**，把「消息不丢、执行不串、出站必达」放在第一位，体验能力（流式、卡片、命令）作为其上增量。
